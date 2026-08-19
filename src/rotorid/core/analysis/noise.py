@@ -1,0 +1,519 @@
+"""Gyro noise characterization and spectral-peak classification (spec section 5.6).
+
+A notch is only worth its phase lag if it sits on a peak that is really there and
+really behaves the way the notch assumes. So this module does not merely find
+peaks -- it *classifies* them by how they move over the flight:
+
+* a peak whose frequency follows motor speed wants a **tracking** notch;
+* a peak that sits at the same frequency whatever the motors do is a **structural**
+  resonance, and a tracking notch will chase it uselessly. The fix is mechanical;
+  a static notch is a stopgap;
+* energy with no peak at all is **broadband**, and only a low-pass or a mechanical
+  change touches it.
+
+Getting this wrong is expensive in a specific way: a tracking notch aimed at a
+frame resonance costs its full phase lag at the crossover and removes nothing.
+
+**Pre- versus post-filter spectra.** The gyro trace both stacks log is
+post-filter, so a PSD computed from it has the current chain baked in. Designing
+a *candidate* chain against it would count the current filters twice -- the same
+error :mod:`rotorid.core.analysis.sysid` guards against on the transfer-function
+side. :func:`prefilter_psd` is the one place that division happens, and
+:func:`NoiseProfile.psd_pre` is where its result is carried.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+import numpy as np
+from scipy.signal import find_peaks, peak_widths, spectrogram
+
+from rotorid.core.filters.chain import FilterChain, OperatingPoint
+from rotorid.core.types import (
+    Axis,
+    FloatArray,
+    LogBundle,
+    NoiseProfile,
+    Signal,
+    SpectralPeak,
+)
+
+__all__ = [
+    "MotorTrack",
+    "classify_peaks",
+    "dterm_noise_rms",
+    "find_spectral_peaks",
+    "motor_track",
+    "noise_floor_db",
+    "noise_profile",
+    "prefilter_psd",
+]
+
+#: Median filter half-width, in log-frequency decades, used to estimate the floor
+#: under the peaks. Wide enough to step over a notch-width peak, narrow enough to
+#: follow the real 1/f-ish shape of a gyro spectrum.
+_FLOOR_HALF_WIDTH_DECADES = 0.15
+
+#: Spectrogram frames per second. Motor speed changes on the order of a second, so
+#: this resolves the tracking without making each frame too short to see the peak.
+_FRAMES_PER_SECOND = 4.0
+
+#: A peak wider than this fraction of its own centre frequency is not a line --
+#: it is a hump, and a notch will not remove it.
+_BROADBAND_WIDTH_FRACTION = 0.5
+
+#: Fractional frequency wander below which a peak counts as stationary in the
+#: RPM-free fallback classification.
+_STATIONARY_WANDER = 0.02
+
+#: Motor frequency must move at least this much across the flight before tracking
+#: correlation means anything. A hover at constant RPM correlates with everything.
+_MIN_TRACK_SPAN = 0.05
+
+_HARMONIC_TOLERANCE = 0.12
+
+
+@dataclass(frozen=True, slots=True)
+class MotorTrack:
+    """Motor fundamental frequency over time, and where the number came from.
+
+    Attributes:
+        source: Provenance, in descending order of trust. ``"throttle_model"`` is
+            a *shape* only -- its absolute scale depends on ``MOT_THST_HOVER``
+            being right -- so it may be used to classify tracking but never to set
+            a notch centre directly.
+        f_hz: Fundamental frequency per sample of :attr:`t`. For
+            ``throttle_model`` this is ``sqrt(throttle)`` in arbitrary units.
+        per_motor_hz: One trace per motor where the log has them, for per-motor
+            notch tracking.
+    """
+
+    t: FloatArray
+    f_hz: FloatArray
+    source: Literal["esc_telemetry", "rpm_sensor", "throttle_model", "none"]
+    per_motor_hz: tuple[FloatArray, ...] = ()
+
+    @property
+    def is_measured(self) -> bool:
+        """Whether the frequency is a measurement rather than a throttle proxy."""
+        return self.source in ("esc_telemetry", "rpm_sensor")
+
+    @property
+    def span_fraction(self) -> float:
+        """Peak-to-peak variation as a fraction of the mean, over the window.
+
+        Near zero means the flight never changed motor speed, and no correlation
+        computed against this trace can distinguish tracking from coincidence.
+        """
+        if self.f_hz.size == 0:
+            return 0.0
+        mean = float(np.mean(self.f_hz))
+        if mean <= 0.0:
+            return 0.0
+        return float(np.ptp(self.f_hz) / mean)
+
+    def mean_hz(self) -> float:
+        """Mean fundamental over the window, or 0.0 if there is no trace."""
+        return float(np.mean(self.f_hz)) if self.f_hz.size else 0.0
+
+    def resample(self, t: FloatArray) -> FloatArray:
+        """Interpolate onto another time base, held flat outside the trace."""
+        if self.f_hz.size == 0:
+            return np.zeros_like(t)
+        return np.asarray(np.interp(t, self.t, self.f_hz), dtype=np.float64)
+
+
+def motor_track(bundle: LogBundle, t_start: float, t_end: float) -> MotorTrack:
+    """Recover motor fundamental frequency over one window.
+
+    Prefers measured RPM over the throttle model, because the throttle model is
+    only as good as ``MOT_THST_HOVER`` and that parameter is the one most often
+    wrong on an untuned vehicle.
+    """
+    per_motor: list[FloatArray] = []
+    times: FloatArray | None = None
+    for index in range(1, 13):
+        key = f"motor.{index}.rpm"
+        if key not in bundle.signals:
+            continue
+        signal = bundle.signals[key]
+        window = (signal.t >= t_start) & (signal.t <= t_end)
+        if not window.any():
+            continue
+        if times is None:
+            times = signal.t[window]
+        per_motor.append(signal.y[window] / 60.0)
+
+    if per_motor and times is not None:
+        stacked = np.vstack([p[: times.size] for p in per_motor])
+        return MotorTrack(
+            t=times,
+            f_hz=np.asarray(np.mean(stacked, axis=0), dtype=np.float64),
+            source="esc_telemetry",
+            per_motor_hz=tuple(np.asarray(p, dtype=np.float64) for p in per_motor),
+        )
+
+    throttle = _throttle_trace(bundle, t_start, t_end)
+    if throttle is not None:
+        t, value = throttle
+        return MotorTrack(t=t, f_hz=np.sqrt(np.clip(value, 0.0, None)), source="throttle_model")
+
+    return MotorTrack(
+        t=np.zeros(0, dtype=np.float64), f_hz=np.zeros(0, dtype=np.float64), source="none"
+    )
+
+
+def _throttle_trace(
+    bundle: LogBundle, t_start: float, t_end: float
+) -> tuple[FloatArray, FloatArray] | None:
+    """Mean normalized motor output over the window, or ``None`` if not logged."""
+    outputs = [
+        bundle.signals[f"motor.{i}.output"]
+        for i in range(1, 13)
+        if f"motor.{i}.output" in bundle.signals
+    ]
+    if not outputs:
+        return None
+    reference = outputs[0]
+    window = (reference.t >= t_start) & (reference.t <= t_end)
+    if not window.any():
+        return None
+    t = reference.t[window]
+    stacked = np.vstack([np.interp(t, s.t, s.y) for s in outputs])
+    return t, np.asarray(np.mean(stacked, axis=0), dtype=np.float64)
+
+
+# --------------------------------------------------------------------------- #
+# Spectra
+# --------------------------------------------------------------------------- #
+
+
+def noise_floor_db(f_hz: FloatArray, psd_db: FloatArray) -> FloatArray:
+    """Running median of the spectrum in log-frequency: the floor under the peaks.
+
+    A single scalar floor is wrong for a gyro spectrum, which slopes; a running
+    median follows the slope while stepping over narrow lines, because a line
+    occupies a small fraction of the window it sits in.
+    """
+    positive = f_hz > 0.0
+    floor = np.full_like(psd_db, np.min(psd_db) if psd_db.size else 0.0)
+    if not positive.any():
+        return floor
+    log_f = np.full_like(f_hz, -np.inf)
+    log_f[positive] = np.log10(f_hz[positive])
+    for i in np.flatnonzero(positive):
+        window = positive & (np.abs(log_f - log_f[i]) <= _FLOOR_HALF_WIDTH_DECADES)
+        floor[i] = float(np.median(psd_db[window]))
+    return floor
+
+
+def find_spectral_peaks(
+    f_hz: FloatArray,
+    psd: FloatArray,
+    *,
+    prominence_db: float,
+    f_min_hz: float = 5.0,
+) -> tuple[tuple[float, float, float], ...]:
+    """Locate peaks and measure them.
+
+    Args:
+        psd: Power spectral density, linear.
+        prominence_db: ``[noise].peak_prominence_db``. How far a peak must stand
+            above the local floor to be worth a notch.
+        f_min_hz: Ignore everything below this. The airframe's own rate response
+            lives down there and is signal, not noise.
+
+    Returns:
+        ``(frequency_hz, height_above_floor_db, width_hz)`` per peak, strongest first.
+    """
+    with np.errstate(divide="ignore"):
+        psd_db = 10.0 * np.log10(np.maximum(psd, 1e-30))
+    band = f_hz >= f_min_hz
+    if band.sum() < 8:
+        return ()
+
+    f = f_hz[band]
+    db = psd_db[band]
+    floor = noise_floor_db(f, db)
+    excess = db - floor
+
+    indices, properties = find_peaks(excess, prominence=prominence_db)
+    if indices.size == 0:
+        return ()
+
+    # -3 dB relative to each peak's own prominence, so the width reported is the
+    # half-power width of the line rather than of the hump it sits on.
+    prominences = np.asarray(properties["prominences"], dtype=np.float64)
+    rel_height = np.clip(3.0 / np.maximum(prominences, 1e-9), 0.0, 1.0)
+    widths_bins = np.array(
+        [
+            float(peak_widths(excess, [int(idx)], rel_height=float(rel))[0][0])
+            for idx, rel in zip(indices, rel_height, strict=True)
+        ]
+    )
+    df = float(np.median(np.diff(f))) if f.size > 1 else 0.0
+
+    peaks = [
+        (float(f[idx]), float(excess[idx]), float(width * df))
+        for idx, width in zip(indices, widths_bins, strict=True)
+    ]
+    return tuple(sorted(peaks, key=lambda p: -p[1]))
+
+
+def classify_peaks(
+    signal: Signal,
+    peaks: tuple[tuple[float, float, float], ...],
+    track: MotorTrack,
+    *,
+    correlation_min: float,
+    t_start: float,
+    t_end: float,
+) -> tuple[SpectralPeak, ...]:
+    """Decide what each peak is by watching it move.
+
+    A spectrogram gives one ridge frequency per frame inside a band around each
+    peak. If that ridge correlates with motor speed, the peak tracks RPM. If motor
+    speed never changed enough to correlate against -- a steady hover -- the
+    correlation is meaningless, and the fallback is whether the ridge moved at
+    all: a peak that stayed put is structural.
+    """
+    window = (signal.t >= t_start) & (signal.t <= t_end)
+    y = signal.y[window]
+    t = signal.t[window]
+    fs = signal.rate_hz
+    nperseg = int(2 ** np.round(np.log2(max(fs / _FRAMES_PER_SECOND, 64.0))))
+    if y.size < 2 * nperseg:
+        nperseg = int(2 ** np.floor(np.log2(max(y.size // 4, 64))))
+
+    out: list[SpectralPeak] = []
+    if y.size < 2 * nperseg:
+        # Too short to watch anything move; report the peaks without a verdict.
+        return tuple(
+            SpectralPeak(f_hz=f, magnitude_db=db, width_hz=w, kind="unknown") for f, db, w in peaks
+        )
+
+    f_grid, t_frames, sxx = spectrogram(y, fs=fs, nperseg=nperseg, noverlap=nperseg // 2)
+    frame_times = t[0] + t_frames
+    track_frames = track.resample(frame_times)
+    track_usable = track.f_hz.size > 0 and track.span_fraction >= _MIN_TRACK_SPAN
+
+    fundamental = track.mean_hz() if track.is_measured else 0.0
+
+    for f_peak, db, width in peaks:
+        ridge = _ridge(f_grid, sxx, f_peak, width)
+        wander = float(np.ptp(ridge) / f_peak) if f_peak > 0.0 else 0.0
+        correlation = _correlation(ridge, track_frames) if track_usable else float("nan")
+        tracks = bool(track_usable and correlation >= correlation_min)
+
+        kind: Literal["motor_fundamental", "motor_harmonic", "structural", "broadband", "unknown"]
+        harmonic: int | None = None
+        if width > _BROADBAND_WIDTH_FRACTION * f_peak:
+            kind = "broadband"
+        elif tracks:
+            harmonic = _harmonic_index(f_peak, fundamental) if fundamental > 0.0 else None
+            kind = "motor_fundamental" if harmonic == 1 else "motor_harmonic"
+        elif track_usable or wander < _STATIONARY_WANDER:
+            # Either we could have seen it track and it did not, or nothing in the
+            # flight moved and the peak still stayed exactly put.
+            kind = "structural"
+        else:
+            kind = "unknown"
+
+        out.append(
+            SpectralPeak(
+                f_hz=f_peak,
+                magnitude_db=db,
+                width_hz=width,
+                kind=kind,
+                tracks_rpm=tracks,
+                harmonic_index=harmonic,
+            )
+        )
+    return tuple(out)
+
+
+def _ridge(f_grid: FloatArray, sxx: FloatArray, f_peak: float, width: float) -> FloatArray:
+    """Frequency of the strongest bin near ``f_peak``, per spectrogram frame."""
+    half = max(width * 2.0, 0.15 * f_peak)
+    band = (f_grid >= f_peak - half) & (f_grid <= f_peak + half)
+    if band.sum() < 2:
+        return np.full(sxx.shape[1], f_peak)
+    sub_f = f_grid[band]
+    return np.asarray(sub_f[np.argmax(sxx[band, :], axis=0)], dtype=np.float64)
+
+
+def _correlation(a: FloatArray, b: FloatArray) -> float:
+    """Pearson correlation, 0.0 where either series is constant."""
+    if a.size != b.size or a.size < 3:
+        return 0.0
+    if np.std(a) <= 0.0 or np.std(b) <= 0.0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _harmonic_index(f_peak: float, fundamental: float) -> int | None:
+    """Which harmonic of the motor fundamental this is, if it is close to one."""
+    if fundamental <= 0.0:
+        return None
+    ratio = f_peak / fundamental
+    nearest = int(round(ratio))
+    if nearest < 1 or abs(ratio - nearest) > _HARMONIC_TOLERANCE * max(nearest, 1):
+        return None
+    return nearest
+
+
+# --------------------------------------------------------------------------- #
+# Undoing the current chain
+# --------------------------------------------------------------------------- #
+
+
+def prefilter_psd(
+    f_hz: FloatArray,
+    psd_post: FloatArray,
+    chain: FilterChain,
+    *,
+    op: OperatingPoint | None,
+    floor_db: float,
+) -> FloatArray:
+    """Recover the pre-filter gyro PSD from a post-filter one.
+
+    The only place a measured spectrum is divided by the current chain. Design
+    code evaluates candidate chains against the *result*, never against the
+    post-filter spectrum, or the filters already flown would be counted twice.
+
+    Where the chain attenuates below ``floor_db`` the division is
+    ill-conditioned -- inside a deep notch the post-filter spectrum carries no
+    information about what was there -- so the divisor is clamped, which makes
+    the reconstruction conservative (an under-estimate) rather than explosive.
+    """
+    magnitude = np.abs(chain.sensor_response(f_hz, op))
+    floor = 10.0 ** (floor_db / 20.0)
+    return np.asarray(psd_post / np.maximum(magnitude, floor) ** 2, dtype=np.float64)
+
+
+def dterm_noise_rms(
+    f_hz: FloatArray,
+    psd_pre: FloatArray,
+    chain: FilterChain,
+    *,
+    kd: float,
+    op: OperatingPoint | None = None,
+    f_max_hz: float | None = None,
+) -> float:
+    """RMS of the D-term output driven by gyro noise, in normalized motor units.
+
+    This is the number that actually limits how much D a vehicle can carry: the
+    derivative differentiates, so noise the gyro LPF leaves at 100 Hz arrives at
+    the motors multiplied by ``kd * 2*pi*100``. It is evaluated by propagating the
+    measured pre-filter spectrum through the candidate sensor chain and the
+    derivative branch, so it answers the question the optimizer needs -- what
+    would this chain do -- rather than reporting what the flown chain did.
+
+    Args:
+        psd_pre: Pre-filter gyro PSD, in ``(rad/s)^2/Hz``.
+        kd: Effective derivative gain.
+        f_max_hz: Integrate no higher than this. Defaults to the loop Nyquist,
+            above which the motors cannot respond anyway.
+
+    Returns:
+        RMS in normalized motor-command units (the units ``rate.*.output`` uses).
+    """
+    limit = f_max_hz if f_max_hz is not None else chain.loop_rate_hz / 2.0
+    band = (f_hz > 0.0) & (f_hz <= limit)
+    if band.sum() < 2:
+        return 0.0
+
+    f = f_hz[band]
+    sensor = np.abs(chain.sensor_response(f, op))
+    dterm = np.abs(chain.dterm_lpf_response(f))
+    derivative = 2.0 * np.pi * f
+    gain = abs(kd) * derivative * sensor * dterm
+    return float(np.sqrt(np.trapezoid(psd_pre[band] * gain**2, f)))
+
+
+# --------------------------------------------------------------------------- #
+# Assembly
+# --------------------------------------------------------------------------- #
+
+
+def noise_profile(
+    bundle: LogBundle,
+    axis: Axis,
+    *,
+    t_start: float,
+    t_end: float,
+    chain: FilterChain | None = None,
+    op: OperatingPoint | None = None,
+    prominence_db: float = 6.0,
+    correlation_min: float = 0.7,
+    deconv_floor_db: float = -20.0,
+    nperseg: int | None = None,
+) -> NoiseProfile:
+    """Characterize the gyro noise on one axis over one window.
+
+    Prefers genuinely pre-filter data when the log has it (batch logging), and
+    otherwise reconstructs the pre-filter spectrum by dividing the modeled chain
+    out of the post-filter one. Which route was taken is visible in
+    :attr:`~rotorid.core.types.NoiseProfile.has_pre_filter` and matters: the
+    reconstruction is only as good as the filter model.
+
+    Raises:
+        ValueError: if the axis has no rate measurement in the log.
+    """
+    from rotorid.core.analysis.spectra import power_spectrum
+
+    key = f"rate.{axis}.measured"
+    if key not in bundle.signals:
+        raise ValueError(f"{key} is not in the log; no noise analysis is possible for {axis}")
+    signal = bundle.signals[key]
+    window = (signal.t >= t_start) & (signal.t <= t_end)
+    y = signal.y[window]
+    if y.size < 64:
+        raise ValueError(f"{axis}: only {y.size} samples in the window; too short for a spectrum")
+
+    fs = signal.rate_hz
+    if nperseg is None:
+        nperseg = int(min(2 ** np.floor(np.log2(y.size / 4.0)), 4096))
+    f_hz, psd_post = power_spectrum(y, fs, nperseg=max(nperseg, 64))
+
+    prefilter_key = f"gyro.{axis}.prefilter"
+    if prefilter_key in bundle.signals:
+        pre_signal = bundle.signals[prefilter_key]
+        pre_window = (pre_signal.t >= t_start) & (pre_signal.t <= t_end)
+        f_pre, psd_pre_raw = power_spectrum(
+            pre_signal.y[pre_window], pre_signal.rate_hz, nperseg=max(nperseg, 64)
+        )
+        # Batch-logged gyro runs at the sensor rate, not the analysis grid rate, so
+        # its spectrum lands on a different grid and has to be brought onto ours.
+        psd_pre = np.asarray(np.interp(f_hz, f_pre, psd_pre_raw), dtype=np.float64)
+    elif chain is not None:
+        psd_pre = prefilter_psd(f_hz, psd_post, chain, op=op, floor_db=deconv_floor_db)
+    else:
+        psd_pre = None
+
+    # Peaks are found on the pre-filter spectrum where one exists: a notch that
+    # already works has removed its own evidence from the post-filter trace, and
+    # a recommendation built on that would remove the notch and reintroduce the peak.
+    search_psd = psd_pre if psd_pre is not None else psd_post
+    raw_peaks = find_spectral_peaks(f_hz, search_psd, prominence_db=prominence_db)
+    track = motor_track(bundle, t_start, t_end)
+    peaks = classify_peaks(
+        signal, raw_peaks, track, correlation_min=correlation_min, t_start=t_start, t_end=t_end
+    )
+
+    with np.errstate(divide="ignore"):
+        post_db = 10.0 * np.log10(np.maximum(psd_post, 1e-30))
+    band = f_hz >= 5.0
+    floor = float(np.median(post_db[band])) if band.any() else float("nan")
+
+    return NoiseProfile(
+        axis=axis,
+        f_hz=f_hz,
+        psd_post=psd_post,
+        noise_floor_db=floor,
+        peaks=peaks,
+        psd_pre=psd_pre,
+        motor_fundamental_track=track.f_hz if track.f_hz.size else None,
+    )

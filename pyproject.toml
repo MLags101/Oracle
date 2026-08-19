@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rotorid"
+version = "0.1.0"
+description = "Offline multirotor filter and PID identification / tuning tool for ArduPilot and PX4 logs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "control>=0.10",
+    "pymavlink>=2.4",
+    "pyulog>=1.0",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6", "pyqtgraph>=0.13"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+rotorid = "rotorid.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rotorid"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"rotorid.toml" = "rotorid/rotorid.toml"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "N", "SIM", "RUF"]
+ignore = [
+    "E741",   # ambiguous name `l` -- L(s) is standard control notation
+    "N802",   # function name should be lowercase -- notch_A_Q mirrors the firmware's
+              # calculate_A_and_Q, and A/Q are the names the docs and source use
+    "N803",   # argument name should be lowercase -- K, H, T are standard
+    "N806",   # variable in function should be lowercase -- same
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+# 3.12, not 3.11: the numpy stubs use PEP 695 `type` statements that mypy will not
+# parse under an older target. Ruff still lints against py311 syntax, so the
+# package's declared floor stays honest.
+python_version = "3.12"
+files = ["src/rotorid"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+# Strict on core/ -- it holds every contract and all the numerics.
+[[tool.mypy.overrides]]
+module = "rotorid.core.*"
+strict = true
+disallow_any_generics = false   # numpy arrays are pervasive and awkward to fully parameterize
+
+[[tool.mypy.overrides]]
+# scipy-stubs is deliberately not installed: its `detrend` parameter is typed as
+# Literal["literal", "constant", False], which does not include the documented and
+# widely used "linear". Contorting correct code to satisfy a stub bug is worse than
+# treating the library as untyped.
+module = ["control.*", "pymavlink.*", "scipy.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: takes more than a couple of seconds",
+    "real_log: needs a real flight log fixture (characterization test)",
+]

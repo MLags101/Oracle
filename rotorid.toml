@@ -1,0 +1,69 @@
+# RotorID default configuration.
+#
+# Every threshold used anywhere in the codebase lives here, with a comment naming
+# its source: a firmware document, a published methodology, or "project default".
+# Code must never hard-code a threshold (spec section 0, rule 8).
+#
+# A user override file is merged on top of this one; the resolved result is hashed
+# into Session.config_hash so a session's numbers are reproducible.
+
+[coherence]
+threshold = 0.6              # project default; below this an FRF bin is not trusted
+min_valid_octaves = 1.0      # narrower than this around crossover -> COHERENCE_NARROW_BAND
+
+[fit]
+max_rms_db = 3.0             # project default
+max_rms_deg = 20.0
+tau_bounds_ms = [5.0, 80.0]  # physically plausible for multirotors
+# Rate-response natural frequency. A multirotor's rate loop is a couple of Hz
+# wide -- ArduPilot's own identification sweeps 0.05-5 Hz for that reason. The
+# upper end leaves room for very small, very stiff craft.
+wn_bounds_hz = [0.5, 40.0]
+zeta_bounds = [0.05, 2.0]
+
+[margins]
+pm_min_deg = 45.0            # ADS-33 / US Army AFDD rotorcraft convention
+gm_min_db = 6.0              # ADS-33 / AFDD
+ms_max_db = 6.0              # ||S||inf <= 2.0, standard robustness bound
+pm_floor_deg = 25.0          # HARD floor. Flight test finds 20-23 deg gives PIO tendency.
+crossover_frac_of_loop = 0.2 # f_c <= 0.2 * (loop_rate / 2)
+
+[filters]
+target_noise_floor_db = -50.0   # ArduPilot guidance: below -50 dB does not need a notch
+phase_budget_deg = 25.0         # max filter-chain phase lag allowed at design crossover
+max_harmonics = 3               # ArduPilot doc: "three harmonics is usually safe"
+freq_bw_ratio_default = 2.0     # ArduPilot doc default (BW = FREQ/2)
+freq_bw_ratio_per_motor = 4.0   # ArduPilot doc: per-motor tracking needs 4:1
+att_min_db = 15.0
+att_max_db = 40.0
+harmonic_min_benefit_db = 3.0   # a harmonic notch must buy this much noise reduction
+model_mismatch_depth_db = 6.0   # measured vs modeled notch depth disagreement -> FILTER_MODEL_MISMATCH
+model_mismatch_center_frac = 0.15  # fractional center-frequency disagreement, same finding
+deconv_floor_db = -20.0         # clamp |F| this far below unity when dividing out (ill-conditioned notches)
+
+[noise]
+dterm_output_rms_limit_pct = 5.0   # project default: D output RMS as % of full motor range
+peak_prominence_db = 6.0
+rpm_track_correlation_min = 0.7    # above this a peak counts as RPM-tracking
+
+[design]
+outer_loop_separation = 4.0     # inner/outer timescale separation (3-5x rule)
+max_gain_step_ratio = 2.0       # beyond this -> GAINS_FAR_FROM_CURRENT
+compute_delay_loops = 1.0       # controller compute delay, in loop periods (project default)
+zoh_delay_loops = 0.5           # zero-order hold, in loop periods (exact for a ZOH)
+
+# Actuator latency by ESC protocol class, milliseconds. Used by filters/latency.py.
+# Values are the command-to-torque transport delay only; motor spin-up dynamics are
+# identified as part of the airframe model, not listed here.
+[design.actuator_latency_ms]
+pwm = 2.0                       # ~490 Hz PWM: up to one frame of latency
+oneshot = 0.5
+dshot = 0.1
+unknown = 1.0
+
+[resample]
+min_oversample_of_highest_notch = 2.5   # grid must resolve the highest modeled notch
+jitter_warn_ratio = 3.0                 # p99 gap / median gap above this -> LOG_RATE_IRREGULAR
+
+[spectra]
+min_averages = 5                # Welch segments; sets nperseg against segment length
