@@ -25,6 +25,7 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from rotorid.core.analysis.model_eval import airframe_response
+from rotorid.core.design.recommend import AxisAnalysis
 from rotorid.core.types import Axis
 from rotorid.gui.state import AppState
 from rotorid.gui.widgets.plot_base import PlotCard, pen
@@ -150,7 +151,7 @@ class IdentifyStage(StageWidget):
             f"mean coherence {model.coherence_mean:.2f}, residual "
             f"{model.fit_rms_db:.2f} dB / {model.fit_rms_deg:.1f} deg. "
             f"Filters removed by the {model.filter_deconvolution} route, from "
-            f"{len(analysis.segments)} segment(s)."
+            f"{len(analysis.segments)} segment(s). " + _loop_removal(analysis)
         )
 
     def _shade_valid_band(self, band: tuple[float, float]) -> None:
@@ -169,3 +170,26 @@ def _db(values: object) -> object:
     array = np.abs(np.asarray(values))
     with np.errstate(divide="ignore"):
         return 20.0 * np.log10(np.maximum(array, 1e-12))
+
+
+def _loop_removal(analysis: AxisAnalysis) -> str:
+    """One sentence on how the feedback loop was divided out of the measurement.
+
+    The screen already says how the *filters* were removed. This is the other
+    half, and the more consequential one: an estimate taken from the mixer
+    command alone under feedback describes the controller as much as the
+    aircraft, and a user looking at a Bode plot has no way to tell from the curve
+    which of the two they are looking at.
+    """
+    plant = analysis.effective
+    if not plant.unbiased:
+        return (
+            "The loop could not be divided out -- nothing in this log is independent "
+            "of the gyro -- so this curve is biased by the controller's own reaction "
+            "to noise."
+        )
+    return (
+        f"Loop divided out against {plant.instrument}; reading it straight from the "
+        f"mixer command instead would move it {plant.bias_db:+.1f} dB and "
+        f"{plant.bias_deg:+.1f} deg."
+    )

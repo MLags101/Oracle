@@ -116,6 +116,17 @@ class DesignResult:
     ``binding_constraint`` is the single most useful line the tool produces: it
     turns "here are your gains" into "here is what is stopping them being higher",
     which is the difference between a number to trust and a number to obey.
+
+    Attributes:
+        designed_crossover_hz: The crossover the search aimed at -- the frequency
+            ``Kp`` was chosen to put unity gain at, and the one bounded by
+            ``crossover_ceiling_hz``. It is not always where the finished loop
+            crosses: a loop with a strong D term can dip through 0 dB, be lifted
+            back over it, and cross again higher up, and
+            ``margins.crossover_hz`` reports that highest crossing because that
+            is the bandwidth the aircraft actually has. The two are separate
+            facts and conflating them makes the ceiling look violated when it
+            was obeyed.
     """
 
     gains: GainSet
@@ -123,6 +134,7 @@ class DesignResult:
     binding_constraint: str
     crossover_ceiling_hz: float
     feasible_count: int
+    designed_crossover_hz: float = 0.0
     rejected: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
 
@@ -215,7 +227,7 @@ def design_gains(
             f"limited by {ceiling_reason}"
         )
 
-    best: tuple[float, GainSet, MarginReport] | None = None
+    best: tuple[float, GainSet, MarginReport, float] | None = None
     feasible_count = 0
     blockers: list[tuple[float, str]] = []
 
@@ -271,8 +283,21 @@ def design_gains(
                 target_lpf_hz=chain.target_lpf_hz,
             )
             if best is None or drb[winner] > best[0]:
+                # The vectorized screen above checks the margin at the crossover
+                # this shape was *aimed* at. A loop that grazes 0 dB elsewhere has
+                # further crossings the screen never looked at, and the margin
+                # that matters is the worst of them. So the winner is confirmed
+                # against the same full evaluation the report will publish --
+                # otherwise the tool could recommend a tune whose own margin
+                # table shows it failing the constraint it was designed under.
                 report = compute_margins(f_grid, candidate_kp * L1)
-                best = (float(drb[winner]), gains, report)
+                if (
+                    report.phase_margin_deg < pm_target
+                    or report.gain_margin_db < targets.gm_min_db
+                    or report.peak_sensitivity_db > targets.ms_max_db
+                ):
+                    continue
+                best = (float(drb[winner]), gains, report, float(f_grid[wc_choices[rows[winner]]]))
 
     if best is None:
         raise ValueError(
@@ -282,14 +307,17 @@ def design_gains(
             "not the gains, is the problem."
         )
 
-    _, gains, report = best
-    binding = _binding_constraint(report, targets, pm_target, ceiling_hz, ceiling_reason)
+    _, gains, report, designed_hz = best
+    binding = _binding_constraint(
+        report, targets, pm_target, ceiling_hz, ceiling_reason, designed_hz
+    )
     return DesignResult(
         gains=gains,
         margins=report,
         binding_constraint=binding,
         crossover_ceiling_hz=ceiling_hz,
         feasible_count=feasible_count,
+        designed_crossover_hz=designed_hz,
         rejected=_summarize_blockers(blockers),
     )
 
@@ -363,6 +391,7 @@ def _binding_constraint(
     pm_target: float,
     ceiling_hz: float,
     ceiling_reason: str,
+    designed_crossover_hz: float,
 ) -> str:
     """Which constraint the winning design is sitting on.
 
@@ -374,6 +403,6 @@ def _binding_constraint(
         "gain_margin": (report.gain_margin_db - targets.gm_min_db) / max(targets.gm_min_db, 1.0),
         "peak_sensitivity": (targets.ms_max_db - report.peak_sensitivity_db)
         / max(targets.ms_max_db, 1.0),
-        ceiling_reason: (ceiling_hz - report.crossover_hz) / ceiling_hz,
+        ceiling_reason: (ceiling_hz - designed_crossover_hz) / ceiling_hz,
     }
     return min(slack, key=lambda k: slack[k])

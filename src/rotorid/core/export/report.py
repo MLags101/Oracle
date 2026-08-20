@@ -24,6 +24,7 @@ import numpy as np
 
 from rotorid.core.guidance.explain import GLOSSARY, explain, explainable, glossary_for
 from rotorid.core.types import (
+    AirframeModel,
     Finding,
     FlightTestPlan,
     FloatArray,
@@ -194,6 +195,13 @@ def _axis_section(axis: str, rec: TuneRecommendation, flown: dict[str, float]) -
     )
 
 
+def _estimator_phrase(model: AirframeModel) -> str:
+    """How the feedback loop was divided out, in words a reader can act on."""
+    if model.estimator == "instrument_variable" and model.instrument is not None:
+        return f"{model.instrument} (independent of the gyro)"
+    return "nothing independent was available -- estimate is biased by feedback"
+
+
 def _model_table(rec: TuneRecommendation) -> str:
     model = rec.model
     rows = [(name, f"{value:.4g}") for name, value in sorted(model.params.items())]
@@ -203,6 +211,7 @@ def _model_table(rec: TuneRecommendation) -> str:
         ("mean coherence", f"{model.coherence_mean:.3f}"),
         ("fit residual", f"{model.fit_rms_db:.2f} dB / {model.fit_rms_deg:.1f} deg"),
         ("filters removed by", model.filter_deconvolution),
+        ("loop removed by", _estimator_phrase(model)),
     ]
     return _table(("Quantity", "Value"), rows, numeric_from=1)
 

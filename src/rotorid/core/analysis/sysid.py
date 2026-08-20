@@ -351,8 +351,9 @@ def fit_airframe(
     n_free = 4 if structure == "so_delay" else 3
     if f.size <= n_free:
         raise ValueError(
-            f"{f.size} usable frequency bins is not enough to fit {n_free} parameters; "
-            "the coherence gate rejected almost everything"
+            f"{f.size} usable frequency bins is not enough to fit {n_free} parameters. "
+            "Almost nothing survived the coherence and excitation gates, so this "
+            "flight did not measure the aircraft over a wide enough band."
         )
 
     K0 = _initial_gain(f, G)

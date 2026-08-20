@@ -270,12 +270,38 @@ class EffectivePlant:
 
     This is the measurement. ``EffectivePlant = F_current * G_air * exp(-tau s)``.
     See spec section 5.3 -- do not treat this as a bare-airframe model.
+
+    Attributes:
+        estimator: How the response was extracted from the log. Flight data is
+            closed-loop data, so this is not a detail of implementation -- it is
+            the difference between an estimate of the aircraft and an estimate of
+            the inverse of its controller. ``"instrument_variable"`` divides the
+            loop out using an exogenous signal and is unbiased;
+            ``"direct_h1"`` is ``Puy/Puu`` on the mixer command, which under
+            feedback is biased by however much of that command is the controller
+            reacting to its own measurement noise.
+        instrument: Canonical key of the exogenous signal, when there was one.
+            ``None`` for ``"direct_h1"``.
+        bias_db: Median magnitude difference, in dB, between this estimate and
+            the direct one over the coherent band. Zero when there is nothing to
+            compare against. Large values mean the two disagree about what the
+            aircraft is, and the direct one is the one that is wrong.
+        bias_deg: The same comparison in phase.
     """
 
     axis: Axis
     frf: FrequencyResponse
     filters_included: bool
     source: Literal["mixer_cmd", "injected_chirp", "raw_gyro"]
+    estimator: Literal["instrument_variable", "direct_h1"] = "direct_h1"
+    instrument: str | None = None
+    bias_db: float = 0.0
+    bias_deg: float = 0.0
+
+    @property
+    def unbiased(self) -> bool:
+        """Whether the loop was divided out rather than assumed away."""
+        return self.estimator == "instrument_variable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +314,11 @@ class AirframeModel:
         filter_deconvolution: How the filter chain was removed. ``"modeled"`` is
             the normal path; ``"raw_gyro"`` means pre-filter data was used directly;
             ``"none"`` means no filters were present to remove.
+        estimator: How the loop was removed -- the other half of the provenance,
+            and the one that decides whether this describes the aircraft or its
+            controller. See :class:`EffectivePlant`.
+        instrument: The exogenous signal the loop was divided out with, when
+            there was one.
         gain_spread_pct: Variation of ``K`` across operating points (spec 5.9).
     """
 
@@ -299,6 +330,8 @@ class AirframeModel:
     valid_band_hz: tuple[float, float]
     coherence_mean: float
     filter_deconvolution: Literal["modeled", "raw_gyro", "none"]
+    estimator: Literal["instrument_variable", "direct_h1"] = "direct_h1"
+    instrument: str | None = None
     gain_spread_pct: float | None = None
 
     def tf(self) -> control.TransferFunction:

@@ -24,10 +24,13 @@ from scipy.signal import csd, get_window, welch
 from rotorid.core.types import BoolArray, ComplexArray, FloatArray, FrequencyResponse
 
 __all__ = [
+    "InstrumentedEstimate",
     "SpectralEstimate",
     "choose_nperseg",
     "combine",
+    "combine_iv",
     "estimate_frf",
+    "estimate_frf_iv",
     "log_smooth",
     "power_spectrum",
 ]
@@ -39,6 +42,20 @@ _OVERLAP_FRACTION = 0.5
 #: Cycles of the lowest frequency of interest that must fit inside one Welch
 #: segment for that frequency to be resolved at all.
 _CYCLES_TO_RESOLVE = 2.0
+
+#: How wide a gap in log frequency may be bridged when deciding which coherent
+#: bins form one band. A tenth of a decade spans a notch's coherence dip without
+#: reaching across the dead zone above where the excitation stopped.
+_MAX_COHERENCE_GAP_DECADES = 0.1
+
+#: How far below its own peak the excitation's power may fall before a frequency
+#: stops counting as excited at all. Coherence cannot answer this question: it
+#: asks whether the output is *explained* by the input, and two signals that are
+#: both essentially zero can be explained by each other perfectly. A chirp is flat
+#: across its sweep so this never bites; a pilot's stick falls away above a couple
+#: of Hz, and this is what stops the identification claiming a band the pilot
+#: never excited.
+_EXCITATION_FLOOR_DB = -40.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +78,16 @@ class SpectralEstimate:
     def H(self) -> ComplexArray:
         """The transfer-function estimate ``Pxy / Pxx`` (the H1 estimator).
 
-        H1 is biased low by noise on the *input*; on both stacks the input is a
-        logged command rather than a measurement, so that noise is negligible and
-        H1 is the right choice.
+        H1 is biased low by noise on the *input*. On an open-loop measurement the
+        input is a logged command rather than a measurement, so that noise is
+        negligible and H1 is the right choice.
+
+        **In closed loop it is not.** The mixer command is the controller's own
+        output, so it contains the gyro noise fed back through the controller, and
+        H1 is then biased towards ``-1/C`` -- an estimate of the inverse
+        controller, wearing the coherence of a good measurement. That is what
+        :func:`estimate_frf_iv` exists to avoid, and it is why every plant now
+        records which estimator produced it.
         """
         with np.errstate(divide="ignore", invalid="ignore"):
             H = np.where(self.Pxx > 0.0, self.Pxy / self.Pxx, 0.0)
@@ -72,10 +96,7 @@ class SpectralEstimate:
     @property
     def coherence(self) -> FloatArray:
         """Ordinary coherence, recomputed from the averaged spectra."""
-        with np.errstate(divide="ignore", invalid="ignore"):
-            denom = self.Pxx * self.Pyy
-            gamma2 = np.where(denom > 0.0, np.abs(self.Pxy) ** 2 / denom, 0.0)
-        return np.asarray(np.clip(gamma2, 0.0, 1.0), dtype=np.float64)
+        return _coherence(self.Pxx, self.Pyy, self.Pxy)
 
     def to_frf(
         self,
@@ -90,19 +111,221 @@ class SpectralEstimate:
             band_hz: Excited band. Bins outside it are invalid even if coherent,
                 because coherence can be high on a frequency nothing excited.
         """
-        gamma2 = self.coherence
-        valid: BoolArray = (gamma2 >= coherence_threshold) & (self.f_hz > 0.0)
-        if band_hz is not None:
-            valid = valid & (self.f_hz >= band_hz[0]) & (self.f_hz <= band_hz[1])
-        return FrequencyResponse(
+        return _gate(
             f_hz=self.f_hz,
             H=self.H,
-            coherence=gamma2,
-            valid_mask=np.asarray(valid, dtype=np.bool_),
+            coherence=self.coherence,
+            coherence_threshold=coherence_threshold,
+            band_hz=band_hz,
             input_signal=self.input_signal,
             output_signal=self.output_signal,
-            n_segments_averaged=self.n_segments,
+            n_segments=self.n_segments,
+            excitation_power=self.Pxx,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentedEstimate:
+    """Spectra for the instrument-variable (Joint Input-Output) estimator.
+
+    Three signals rather than two: an exogenous instrument ``r``, the plant input
+    ``u``, and the response ``y``. The plant is then
+
+    .. code-block:: text
+
+        G(jw) = (r -> y) / (r -> u) = Pry / Pru
+
+    which is unbiased under feedback for *any* ``r`` that is uncorrelated with the
+    measurement noise, whatever the controller is and wherever ``r`` enters the
+    loop. Both ArduPilot injection points fall out of the same expression:
+
+    ==================================  ============  =============  =====
+    injection                           ``y/r``       ``u/r``        ratio
+    ==================================  ============  =============  =====
+    rate target (``SID_AXIS`` 7-9)      ``GC/(1+GC)`` ``C/(1+GC)``   ``G``
+    mixer (``SID_AXIS`` 10-12)          ``G/(1+GC)``  ``1/(1+GC)``   ``G``
+    ==================================  ============  =============  =====
+
+    That generality is the point. It means the same estimator serves an injected
+    chirp and a pilot's stick, and it means nothing here has to model the
+    controller in order to divide it out.
+    """
+
+    f_hz: FloatArray
+    Prr: FloatArray
+    Puu: FloatArray
+    Pyy: FloatArray
+    Pru: ComplexArray
+    Pry: ComplexArray
+    n_segments: int
+    instrument_signal: str
+    input_signal: str
+    output_signal: str
+
+    @property
+    def H(self) -> ComplexArray:
+        """``Pry / Pru`` -- the plant, with the loop divided out."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            H = np.where(np.abs(self.Pru) > 0.0, self.Pry / self.Pru, 0.0)
+        return np.asarray(H, dtype=np.complex128)
+
+    @property
+    def coherence_ru(self) -> FloatArray:
+        """How much of the plant input the instrument accounts for."""
+        return _coherence(self.Prr, self.Puu, self.Pru)
+
+    @property
+    def coherence_ry(self) -> FloatArray:
+        """How much of the response the instrument accounts for."""
+        return _coherence(self.Prr, self.Pyy, self.Pry)
+
+    @property
+    def coherence(self) -> FloatArray:
+        """The weaker of the two, elementwise.
+
+        The estimate is a *ratio*, so it is only as good as its worse half. A
+        frequency where the stick clearly moved the aircraft but not measurably
+        the mixer command has a well-determined numerator over a numerically
+        meaningless denominator, and the quotient is noise -- which the ordinary
+        coherence of either half on its own would not reveal.
+        """
+        return np.asarray(np.minimum(self.coherence_ru, self.coherence_ry), dtype=np.float64)
+
+    def to_frf(
+        self,
+        *,
+        coherence_threshold: float,
+        band_hz: tuple[float, float] | None = None,
+    ) -> FrequencyResponse:
+        """Gate the estimate and hand back the downstream contract."""
+        return _gate(
+            f_hz=self.f_hz,
+            H=self.H,
+            coherence=self.coherence,
+            coherence_threshold=coherence_threshold,
+            band_hz=band_hz,
+            input_signal=self.input_signal,
+            output_signal=self.output_signal,
+            n_segments=self.n_segments,
+            excitation_power=self.Prr,
+        )
+
+
+def _was_excited(f_hz: FloatArray, power: FloatArray, floor_db: float) -> BoolArray:
+    """Where the excitation actually had power, relative to its own peak.
+
+    The companion to the coherence gate, answering the question coherence cannot:
+    not "is the output explained by the input" but "was there an input at all".
+    Without it, a flight whose stick stopped at 3 Hz can report a coherent band at
+    50 Hz, because up there both signals are noise and the noise in one genuinely
+    does explain the noise in the other -- they arrived through the same loop.
+    """
+    positive = f_hz > 0.0
+    if not positive.any():
+        return np.zeros_like(f_hz, dtype=np.bool_)
+    peak = float(np.max(power[positive]))
+    if peak <= 0.0:
+        return np.zeros_like(f_hz, dtype=np.bool_)
+    return np.asarray(power >= peak * 10.0 ** (floor_db / 10.0), dtype=np.bool_)
+
+
+def _one_coherent_band(
+    f_hz: FloatArray, valid: BoolArray, coherence: FloatArray, max_gap_decades: float
+) -> BoolArray:
+    """Keep the coherent band, and drop the islands above it.
+
+    Coherence is scale-free: it asks whether the output is *explained* by the
+    input, not whether either had any energy. Above the band an instrument
+    actually excited, both spectra are noise, and a handful of bins will pass any
+    threshold by luck. Individually they look like ordinary valid bins. Together
+    they do real damage, because
+    :attr:`~rotorid.core.types.FrequencyResponse.valid_band_hz` reads the first
+    and last valid bin, so one lucky bin at 75 Hz reports a band four times wider
+    than the flight supports -- and the fit then weights those bins against the
+    real ones. On a pilot-flown log, where coherence dies above a few Hz, that
+    was enough to drag the identified natural frequency onto its bound.
+
+    So the valid set is reduced to a single contiguous band: bins are grouped by
+    their spacing in log frequency, and gaps narrower than ``max_gap_decades`` are
+    bridged. Bridging matters -- a notch inside the excited band produces a
+    legitimate coherence dip, and splitting the band there would throw away
+    everything above it. Bins inside the dip stay invalid; only the *span* is
+    bridged.
+
+    Groups are scored by coherence-weighted width in decades, not by how many
+    bins they hold. A linear FFT grid has ten times as many bins in the decade
+    from 20 to 200 Hz as in the one from 2 to 20, so counting bins hands the
+    decision to the top of the spectrum -- which is exactly where the noise
+    islands are. Scoring by decades, weighted by how well each bin is actually
+    explained, is the same measure
+    :func:`rotorid.core.analysis.sysid.fit_weights` uses to decide what the fit
+    listens to, so the band and the fit agree about what matters.
+    """
+    indices = np.nonzero(valid)[0]
+    if indices.size <= 1:
+        return valid
+
+    positive = f_hz[indices] > 0.0
+    if not positive.all():
+        indices = indices[positive]
+        if indices.size <= 1:
+            return valid
+
+    log_f = np.log10(f_hz[indices])
+    splits = np.nonzero(np.diff(log_f) > max_gap_decades)[0]
+    groups = np.split(indices, splits + 1)
+
+    def _evidence(group: np.ndarray) -> float:
+        if group.size < 2:
+            return 0.0
+        widths = np.gradient(np.log10(f_hz[group]))
+        return float(np.sum(coherence[group] * np.abs(widths)))
+
+    best = max(groups, key=_evidence)
+
+    kept = np.zeros_like(valid)
+    kept[best[0] : best[-1] + 1] = valid[best[0] : best[-1] + 1]
+    return np.asarray(kept, dtype=np.bool_)
+
+
+def _coherence(Pxx: FloatArray, Pyy: FloatArray, Pxy: ComplexArray) -> FloatArray:
+    """Ordinary coherence from averaged spectra, clipped to ``[0, 1]``."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denom = Pxx * Pyy
+        gamma2 = np.where(denom > 0.0, np.abs(Pxy) ** 2 / denom, 0.0)
+    return np.asarray(np.clip(gamma2, 0.0, 1.0), dtype=np.float64)
+
+
+def _gate(
+    *,
+    f_hz: FloatArray,
+    H: ComplexArray,
+    coherence: FloatArray,
+    coherence_threshold: float,
+    band_hz: tuple[float, float] | None,
+    input_signal: str,
+    output_signal: str,
+    n_segments: int,
+    excitation_power: FloatArray | None = None,
+    max_gap_decades: float = _MAX_COHERENCE_GAP_DECADES,
+    excitation_floor_db: float = _EXCITATION_FLOOR_DB,
+) -> FrequencyResponse:
+    """Apply the coherence, excitation and band gates. Shared by both estimators."""
+    valid: BoolArray = (coherence >= coherence_threshold) & (f_hz > 0.0)
+    if band_hz is not None:
+        valid = valid & (f_hz >= band_hz[0]) & (f_hz <= band_hz[1])
+    if excitation_power is not None:
+        valid = valid & _was_excited(f_hz, excitation_power, excitation_floor_db)
+    valid = _one_coherent_band(f_hz, valid, coherence, max_gap_decades)
+    return FrequencyResponse(
+        f_hz=f_hz,
+        H=H,
+        coherence=coherence,
+        valid_mask=np.asarray(valid, dtype=np.bool_),
+        input_signal=input_signal,
+        output_signal=output_signal,
+        n_segments_averaged=n_segments,
+    )
 
 
 def choose_nperseg(
@@ -168,31 +391,95 @@ def estimate_frf(
     if u.shape != y.shape:
         raise ValueError(f"input and output lengths differ: {u.shape} vs {y.shape}")
 
-    window = get_window("hann", nperseg)
-    noverlap = int(nperseg * _OVERLAP_FRACTION)
-    kwargs = {
-        "fs": sample_rate_hz,
-        "window": window,
-        "nperseg": nperseg,
-        "noverlap": noverlap,
-        "detrend": detrend,
-    }
+    kwargs = _welch_kwargs(sample_rate_hz, nperseg, detrend)
     f, Pxx = welch(u, **kwargs)
     _, Pyy = welch(y, **kwargs)
     _, Pxy = csd(u, y, **kwargs)
-
-    step = nperseg - noverlap
-    n_segments = max(1, (u.size - noverlap) // step)
 
     return SpectralEstimate(
         f_hz=np.asarray(f, dtype=np.float64),
         Pxx=np.asarray(Pxx, dtype=np.float64),
         Pyy=np.asarray(Pyy, dtype=np.float64),
         Pxy=np.asarray(Pxy, dtype=np.complex128),
-        n_segments=n_segments,
+        n_segments=_n_segments(u.size, nperseg),
         input_signal=input_signal,
         output_signal=output_signal,
     )
+
+
+def estimate_frf_iv(
+    r: FloatArray,
+    u: FloatArray,
+    y: FloatArray,
+    sample_rate_hz: float,
+    *,
+    nperseg: int,
+    instrument_signal: str,
+    input_signal: str,
+    output_signal: str,
+    detrend: str = "linear",
+) -> InstrumentedEstimate:
+    """Instrument-variable estimate of the plant from ``u`` to ``y``.
+
+    Uses the exogenous signal ``r`` as an instrument, giving ``Pry / Pru``. See
+    :class:`InstrumentedEstimate` for why that is the plant and not something
+    else.
+
+    The instrument has to be genuinely exogenous -- uncorrelated with the gyro
+    noise -- or the bias it removes comes straight back. In descending order of
+    how well they satisfy that: an injected chirp, the pilot's commanded lean
+    angle, the rate setpoint. The last is the weakest because in Stabilize it is
+    ``ATC_ANG_*_P`` times the attitude error, so it carries gyro noise round
+    through the outer loop; the caller is responsible for saying which rung it
+    used.
+
+    Args:
+        r: The instrument. Same length and sample rate as ``u`` and ``y``.
+
+    Raises:
+        ValueError: if the three signals differ in length.
+    """
+    if not (r.shape == u.shape == y.shape):
+        raise ValueError(
+            f"instrument, input and output lengths differ: {r.shape} vs {u.shape} vs {y.shape}"
+        )
+
+    kwargs = _welch_kwargs(sample_rate_hz, nperseg, detrend)
+    f, Prr = welch(r, **kwargs)
+    _, Puu = welch(u, **kwargs)
+    _, Pyy = welch(y, **kwargs)
+    _, Pru = csd(r, u, **kwargs)
+    _, Pry = csd(r, y, **kwargs)
+
+    return InstrumentedEstimate(
+        f_hz=np.asarray(f, dtype=np.float64),
+        Prr=np.asarray(Prr, dtype=np.float64),
+        Puu=np.asarray(Puu, dtype=np.float64),
+        Pyy=np.asarray(Pyy, dtype=np.float64),
+        Pru=np.asarray(Pru, dtype=np.complex128),
+        Pry=np.asarray(Pry, dtype=np.complex128),
+        n_segments=_n_segments(r.size, nperseg),
+        instrument_signal=instrument_signal,
+        input_signal=input_signal,
+        output_signal=output_signal,
+    )
+
+
+def _welch_kwargs(sample_rate_hz: float, nperseg: int, detrend: str) -> dict[str, object]:
+    """Shared Welch/CSD settings, so both estimators land on the same grid."""
+    return {
+        "fs": sample_rate_hz,
+        "window": get_window("hann", nperseg),
+        "nperseg": nperseg,
+        "noverlap": int(nperseg * _OVERLAP_FRACTION),
+        "detrend": detrend,
+    }
+
+
+def _n_segments(n_samples: int, nperseg: int) -> int:
+    """How many overlapping Welch windows fit in a record of this length."""
+    noverlap = int(nperseg * _OVERLAP_FRACTION)
+    return max(1, (n_samples - noverlap) // (nperseg - noverlap))
 
 
 def power_spectrum(
@@ -256,6 +543,59 @@ def combine(estimates: Sequence[SpectralEstimate]) -> SpectralEstimate:
         Pyy=np.asarray(Pyy, dtype=np.float64),
         Pxy=np.asarray(Pxy, dtype=np.complex128),
         n_segments=int(total),
+        input_signal=first.input_signal,
+        output_signal=first.output_signal,
+    )
+
+
+def combine_iv(estimates: Sequence[InstrumentedEstimate]) -> InstrumentedEstimate:
+    """Merge instrument-variable estimates, exactly as :func:`combine` does.
+
+    The five spectra are averaged and the ratio taken afterwards, never the other
+    way round. Averaging finished ``H`` values from several segments would weight
+    a segment where the instrument barely moved the same as one where it moved a
+    lot, which is the whole reason this module keeps spectra rather than transfer
+    functions.
+
+    Raises:
+        ValueError: if the estimates are empty, describe different signals, or
+            sit on different frequency grids.
+    """
+    if not estimates:
+        raise ValueError("nothing to combine")
+    first = estimates[0]
+    if len(estimates) == 1:
+        return first
+
+    names = (first.instrument_signal, first.input_signal, first.output_signal)
+    for e in estimates[1:]:
+        if e.f_hz.shape != first.f_hz.shape or not np.allclose(e.f_hz, first.f_hz):
+            raise ValueError(
+                "cannot combine estimates on different frequency grids; "
+                "use the same nperseg and sample rate for every segment"
+            )
+        if (e.instrument_signal, e.input_signal, e.output_signal) != names:
+            raise ValueError(
+                f"cannot combine {e.instrument_signal}->({e.input_signal}, {e.output_signal}) "
+                f"with {names[0]}->({names[1]}, {names[2]})"
+            )
+
+    weights = np.array([float(e.n_segments) for e in estimates])
+    total = float(weights.sum())
+
+    def _mean(attr: str) -> np.ndarray:
+        stacked = sum(w * getattr(e, attr) for w, e in zip(weights, estimates, strict=True))
+        return np.asarray(stacked) / total
+
+    return InstrumentedEstimate(
+        f_hz=first.f_hz,
+        Prr=np.asarray(_mean("Prr"), dtype=np.float64),
+        Puu=np.asarray(_mean("Puu"), dtype=np.float64),
+        Pyy=np.asarray(_mean("Pyy"), dtype=np.float64),
+        Pru=np.asarray(_mean("Pru"), dtype=np.complex128),
+        Pry=np.asarray(_mean("Pry"), dtype=np.complex128),
+        n_segments=int(total),
+        instrument_signal=first.instrument_signal,
         input_signal=first.input_signal,
         output_signal=first.output_signal,
     )

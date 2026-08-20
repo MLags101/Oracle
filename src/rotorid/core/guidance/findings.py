@@ -277,6 +277,88 @@ def check_log_rate(context: GuidanceContext) -> list[Finding]:
     ]
 
 
+def check_estimator(context: GuidanceContext) -> list[Finding]:
+    """Whether the loop was divided out of the identification, or assumed away.
+
+    Every flight log is closed-loop data. The mixer command is the controller's
+    own output, so it carries the gyro noise fed back through the controller, and
+    the ordinary estimate of the plant from it is biased towards the inverse of
+    that controller -- an answer that looks like a measurement and is not one.
+    Dividing the loop out needs an exogenous signal: the injected chirp, or
+    failing that the pilot's commanded attitude.
+
+    Two different things can go wrong, and they want different responses. Having
+    no such signal at all is a blocker, because the number is wrong by an unknown
+    amount. Having one, and finding that it disagrees sharply with the direct
+    estimate, is a warning: the right answer was used, and the size of the
+    disagreement is worth seeing because it says how much of the mixer command
+    was the controller chasing its own noise.
+    """
+    warn_db = context.config.float_("estimator", "bias_warn_db")
+    warn_deg = context.config.float_("estimator", "bias_warn_deg")
+    ardupilot = context.bundle.stack == "ardupilot"
+    out: list[Finding] = []
+    for axis in context.axes():
+        plant = context.analyses[axis].effective
+        if not plant.unbiased:
+            out.append(
+                Finding(
+                    severity="blocker",
+                    code="ESTIMATOR_BIASED",
+                    title=f"{axis}: nothing in this log is independent of the gyro",
+                    detail=(
+                        "The aircraft was identified from the mixer command alone. That "
+                        "command is what the controller produced from the gyro, so "
+                        "whatever noise was on the gyro is in both signals, and the "
+                        "estimate is pulled towards the inverse of the controller rather "
+                        "than towards the aircraft. It is not a weaker measurement of the "
+                        "right thing; it is a measurement of something else, and how far "
+                        "off it lands depends on how noisy the flight was."
+                    ),
+                    action=(
+                        "Log the ATT message so the pilot's commanded attitude is "
+                        "available as an independent reference -- add the ATTITUDE bits "
+                        "to LOG_BITMASK -- or fly a SYSTEMID sweep, which is better still."
+                        if ardupilot
+                        else "Add the high-rate profile to SDLOG_PROFILE so "
+                        "vehicle_attitude_setpoint is logged, and re-fly."
+                    ),
+                    evidence={"axis_index": float(AXES.index(axis))},
+                    doc_link=_doc(context),
+                )
+            )
+            continue
+        if abs(plant.bias_db) < warn_db and abs(plant.bias_deg) < warn_deg:
+            continue
+        out.append(
+            Finding(
+                severity="warning",
+                code="ESTIMATOR_BIAS_LARGE",
+                title=f"{axis}: feedback moved the answer by {plant.bias_db:+.1f} dB",
+                detail=(
+                    f"Identified against {plant.instrument}, which is independent of the "
+                    f"gyro, so the number used is the unbiased one. Reading the same "
+                    f"flight the naive way -- straight from the mixer command -- gives an "
+                    f"aircraft {plant.bias_db:+.1f} dB and {plant.bias_deg:+.1f} deg "
+                    f"different. That gap is the controller reacting to its own noise, and "
+                    f"a gap this size means the excitation was weak next to the noise, "
+                    f"which limits how much of the band this flight can speak for."
+                ),
+                action=(
+                    "Nothing is wrong with the result. To narrow the gap on the next "
+                    "flight, excite the axis harder relative to the noise: a larger "
+                    "SID_MAGNITUDE, or firmer and more deliberate stick movement."
+                    if ardupilot
+                    else "Nothing is wrong with the result. To narrow the gap, excite the "
+                    "axis harder relative to the noise on the next flight."
+                ),
+                evidence={"bias_db": plant.bias_db, "bias_deg": plant.bias_deg},
+                plot_hint="bode",
+            )
+        )
+    return out
+
+
 def check_prefilter_data(context: GuidanceContext) -> list[Finding]:
     """Whether the log lets the filter model be checked against the aircraft."""
     bundle = context.bundle
@@ -733,6 +815,7 @@ CHECKS: tuple[Check, ...] = (
     check_excitation,
     check_identification_band,
     check_log_rate,
+    check_estimator,
     check_prefilter_data,
     check_esc_telemetry,
     check_cpu_headroom,

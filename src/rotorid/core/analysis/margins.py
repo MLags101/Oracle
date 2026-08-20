@@ -145,13 +145,17 @@ def _interp_crossing(x: FloatArray, y: FloatArray, level: float, index: int) -> 
     return float(np.exp(x0 + (level - y0) * (x1 - x0) / (y1 - y0)))
 
 
+def _downward_crossings(f: FloatArray, values: FloatArray, level: float) -> list[float]:
+    """Every frequency where ``values`` falls through ``level``, ascending."""
+    above = values >= level
+    edges = np.nonzero(above[:-1] & ~above[1:])[0]
+    return [_interp_crossing(f, values, level, int(i)) for i in edges]
+
+
 def _first_downward_crossing(f: FloatArray, values: FloatArray, level: float) -> float | None:
     """Lowest frequency where ``values`` falls through ``level``."""
-    above = values >= level
-    for i in range(values.size - 1):
-        if above[i] and not above[i + 1]:
-            return _interp_crossing(f, values, level, i)
-    return None
+    crossings = _downward_crossings(f, values, level)
+    return crossings[0] if crossings else None
 
 
 def _first_upward_crossing(f: FloatArray, values: FloatArray, level: float) -> float | None:
@@ -175,10 +179,23 @@ def _first_upward_crossing(f: FloatArray, values: FloatArray, level: float) -> f
 def compute_margins(f_hz: FloatArray, L: ComplexArray) -> MarginReport:
     """Read gain, phase, delay and sensitivity margins off the broken loop.
 
-    Gain crossover is taken as the **lowest** frequency where ``|L|`` falls
-    through unity. On a loop with a lightly damped airframe ``|L|`` can rise back
-    above unity around the resonance, and taking the last crossing would report a
-    margin at a frequency the controller never actually operates at.
+    A loop with a lightly damped airframe can cross unity gain more than once:
+    ``|L|`` falls through 0 dB, rises back through it around the resonance, and
+    falls again. Every one of those crossings is a place the loop could be
+    destabilized, so the reported phase margin is the **worst** of them, and the
+    reported crossover is the frequency where that worst margin occurs. Likewise
+    the gain margin is the smallest over every phase crossing of -180 degrees.
+
+    Reporting the *first* crossing instead -- which this did until it was caught
+    by a design that changed by 65% under a 4e-15 perturbation of the measured
+    response -- is both optimistic and numerically unstable. When ``|L|`` grazes
+    0 dB, two extra crossings appear and disappear together as the tangency is
+    crossed, so "the first crossing" jumps discontinuously between branches while
+    the worst margin varies smoothly: at the moment of tangency the new pair
+    carries the phase of the tangency point, which is a value the report already
+    had. Stability under perturbation is not a nicety here. A recommendation that
+    moves because the tenth significant figure of the input moved is not a
+    recommendation.
 
     ``disturbance_rejection_peak_db`` and ``peak_sensitivity_db`` are the same
     quantity, ``||S||inf``, under the standard definitions. Both names are
@@ -194,32 +211,49 @@ def compute_margins(f_hz: FloatArray, L: ComplexArray) -> MarginReport:
     mag_db = 20.0 * np.log10(np.abs(L))
     phase_deg = np.degrees(np.unwrap(np.angle(L)))
 
-    crossover_hz = _first_downward_crossing(f, mag_db, 0.0)
-    if crossover_hz is None:
+    crossings = _downward_crossings(f, mag_db, 0.0)
+    if not crossings:
         raise ValueError(
             "|L| does not cross unity anywhere in the design band; "
             f"it runs {mag_db[0]:.1f} to {mag_db[-1]:.1f} dB over {f[0]:g}-{f[-1]:g} Hz"
         )
 
-    phase_at_wc = float(np.interp(np.log(crossover_hz), np.log(f), phase_deg))
     # Wrap into (-180, 180]. The unwrapped phase can be several turns down by the
     # time a delay-heavy loop reaches crossover, and the margin is the distance to
     # the *nearest* -180 crossing, not to the first one.
-    phase_margin_deg = (180.0 + phase_at_wc + 180.0) % 360.0 - 180.0
+    log_f = np.log(f)
+    margins = [
+        (180.0 + float(np.interp(np.log(wc), log_f, phase_deg)) + 180.0) % 360.0 - 180.0
+        for wc in crossings
+    ]
+    # Two different questions with two different answers. The loop's *bandwidth*
+    # is the highest frequency it still passes unity at; its *margin* is the
+    # smallest room to spare at any of them. Quoting the pair from one crossing
+    # would understate the bandwidth or overstate the margin.
+    crossover_hz = crossings[-1]
+    phase_margin_deg = min(margins)
 
-    # Gain margin: where the phase first passes -180 degrees.
-    gm_hz = _first_downward_crossing(f, phase_deg, -180.0)
-    if gm_hz is None:
-        gain_margin_db = float("inf")
-    else:
-        gain_margin_db = -float(np.interp(np.log(gm_hz), np.log(f), mag_db))
+    # Gain margin: the least room to spare over every phase crossing of -180.
+    gm_crossings = _downward_crossings(f, phase_deg, -180.0)
+    gain_margin_db = (
+        min(-float(np.interp(np.log(hz), log_f, mag_db)) for hz in gm_crossings)
+        if gm_crossings
+        else float("inf")
+    )
 
     S_db = -20.0 * np.log10(np.abs(1.0 + L))
     peak_sensitivity_db = float(np.max(S_db))
     drb_hz = _first_upward_crossing(f, S_db, _DRB_LEVEL_DB)
 
-    w_c = 2.0 * np.pi * crossover_hz
-    delay_margin_ms = 1000.0 * np.radians(max(phase_margin_deg, 0.0)) / w_c
+    # Delay margin is per crossing and the binding one is the smallest: the
+    # amount of extra lag the loop tolerates is set by whichever crossing runs
+    # out of phase first, which is not necessarily the one with the worst margin
+    # in degrees -- a small margin at a low frequency buys more time than a
+    # larger one high up.
+    delay_margin_ms = min(
+        1000.0 * np.radians(max(pm, 0.0)) / (2.0 * np.pi * wc)
+        for pm, wc in zip(margins, crossings, strict=True)
+    )
 
     return MarginReport(
         gain_margin_db=gain_margin_db,

@@ -19,14 +19,24 @@ no-op.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 
 from rotorid.config import Config
+from rotorid.core.analysis.instrument import Rung, choose_instrument, windowed_signals
 from rotorid.core.analysis.margins import LoopDelay, design_grid, loop_delay
 from rotorid.core.analysis.noise import MotorTrack, motor_track, noise_profile
-from rotorid.core.analysis.spectra import choose_nperseg, combine, estimate_frf
+from rotorid.core.analysis.spectra import (
+    InstrumentedEstimate,
+    SpectralEstimate,
+    choose_nperseg,
+    combine,
+    combine_iv,
+    estimate_frf,
+    estimate_frf_iv,
+)
 from rotorid.core.analysis.step import step_metrics, step_response
 from rotorid.core.analysis.sysid import DeconvolvedPlant, deconvolve, fit_airframe
 from rotorid.core.design.controller import controller_for
@@ -46,7 +56,7 @@ from rotorid.core.types import (
     Confidence,
     EffectivePlant,
     ExcitationSegment,
-    FloatArray,
+    FrequencyResponse,
     LogBundle,
     NoiseProfile,
     TuneRecommendation,
@@ -146,45 +156,70 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
         raise ValueError(f"no usable excitation found on {axis}. {how}")
 
     measured_key = f"rate.{axis}.measured"
-    excite_key = f"excite.{axis}"
     output_key = f"rate.{axis}.output"
     if measured_key not in bundle.signals:
         raise ValueError(f"{measured_key} is not in the log; nothing to identify against")
 
-    # The injected chirp is a far better reference than the mixer command, which
-    # also contains the controller reacting to the vehicle's own motion.
-    if excite_key in bundle.signals:
-        input_key, source = excite_key, "injected_chirp"
-    elif output_key in bundle.signals:
-        input_key, source = output_key, "mixer_cmd"
-    else:
-        raise ValueError(f"neither {excite_key} nor {output_key} is in the log")
-
+    instrument_key, rung = choose_instrument(bundle, axis)
     chain = chain_from_bundle(bundle, axis)
     fs = bundle.sample_rate_hz
     f_lowest = min((s.f_start_hz or 0.5) for s in segments)
     min_averages = config.int_("spectra", "min_averages")
 
-    estimates = []
+    # Both estimators are computed on every segment. The instrument-variable one
+    # is the answer; the direct one is kept so the two can be compared, which is
+    # both the bias diagnostic and the check on the plant-input assembly.
+    iv_estimates: list[InstrumentedEstimate] = []
+    direct_estimates: list[SpectralEstimate] = []
+    rungs: set[Rung] = set()
+    summed = False
     for segment in segments:
-        u, y = _windowed(bundle, input_key, measured_key, segment)
+        cut = windowed_signals(bundle, axis, segment, instrument_key=instrument_key, rung=rung)
         try:
-            nperseg = choose_nperseg(u.size, fs, f_lowest_hz=f_lowest, min_averages=min_averages)
+            nperseg = choose_nperseg(
+                cut.plant_input.size, fs, f_lowest_hz=f_lowest, min_averages=min_averages
+            )
         except ValueError:
             continue
-        estimates.append(
+        rungs.add(cut.rung)
+        summed = summed or cut.summed_injection
+        direct_estimates.append(
             estimate_frf(
-                u, y, fs, nperseg=nperseg, input_signal=input_key, output_signal=measured_key
+                cut.plant_input,
+                cut.response,
+                fs,
+                nperseg=nperseg,
+                input_signal=cut.input_key,
+                output_signal=cut.output_key,
             )
         )
-    if not estimates:
+        if cut.instrument is not None and cut.instrument_key is not None:
+            iv_estimates.append(
+                estimate_frf_iv(
+                    cut.instrument,
+                    cut.plant_input,
+                    cut.response,
+                    fs,
+                    nperseg=nperseg,
+                    instrument_signal=cut.instrument_key,
+                    input_signal=cut.input_key,
+                    output_signal=cut.output_key,
+                )
+            )
+    if not direct_estimates:
         raise ValueError(
             f"every {axis} segment is too short to resolve {f_lowest:g} Hz; "
             "lengthen SID_T_REC or start the sweep higher"
         )
+    # A segment where the stick sat still demotes only itself; mixing an
+    # instrumented and an uninstrumented segment into one estimate would be
+    # averaging an unbiased number with a biased one.
+    if len(iv_estimates) != len(direct_estimates):
+        iv_estimates = []
+    effective_rung: Rung = rung if iv_estimates else "none"
 
     f_stop = max((s.f_stop_hz or fs / 4.0) for s in segments)
-    ceiling = evidence_ceiling_hz(bundle, input_key, measured_key)
+    ceiling = evidence_ceiling_hz(bundle, output_key, measured_key)
     if ceiling is not None:
         f_stop = min(f_stop, ceiling)
     if f_stop <= f_lowest:
@@ -196,14 +231,26 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
             "There is no band left to identify over."
         )
     band = (f_lowest, f_stop)
-    frf = combine(estimates).to_frf(
-        coherence_threshold=config.float_("coherence", "threshold"), band_hz=band
-    )
+    threshold = config.float_("coherence", "threshold")
+    direct_frf = combine(direct_estimates).to_frf(coherence_threshold=threshold, band_hz=band)
+
+    if iv_estimates:
+        frf = combine_iv(iv_estimates).to_frf(coherence_threshold=threshold, band_hz=band)
+        estimator: Literal["instrument_variable", "direct_h1"] = "instrument_variable"
+        bias_db, bias_deg = _estimator_disagreement(frf, direct_frf)
+    else:
+        frf, estimator = direct_frf, "direct_h1"
+        bias_db, bias_deg = 0.0, 0.0
+
     effective = EffectivePlant(
         axis=axis,
         frf=frf,
         filters_included=True,
-        source=source,  # type: ignore[arg-type]
+        source="injected_chirp" if effective_rung == "injected_chirp" else "mixer_cmd",
+        estimator=estimator,
+        instrument=instrument_key if iv_estimates else None,
+        bias_db=bias_db,
+        bias_deg=bias_deg,
     )
 
     op = hover_operating_point(bundle, segments[0].t_start, segments[-1].t_end)
@@ -216,6 +263,11 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
         zeta_bounds=_pair(config, "fit", "zeta_bounds"),
         tau_bounds_ms=_pair(config, "fit", "tau_bounds_ms"),
     )
+    # The fit knows how the filters were removed but not how the loop was. Both
+    # halves of that provenance travel with the model, because everything that
+    # renders a model -- report, screen, explanation -- has to be able to say
+    # whether it is describing the aircraft or its controller.
+    airframe = replace(airframe, estimator=estimator, instrument=effective.instrument)
 
     noise, track = _noise_for(bundle, axis, segments, chain, op, config, ceiling)
 
@@ -335,12 +387,33 @@ def _pair(config: Config, section: str, key: str) -> tuple[float, float]:
     return values[0], values[1]
 
 
-def _windowed(
-    bundle: LogBundle, input_key: str, output_key: str, segment: ExcitationSegment
-) -> tuple[FloatArray, FloatArray]:
-    u_sig, y_sig = bundle.signal(input_key), bundle.signal(output_key)
-    window = (u_sig.t >= segment.t_start) & (u_sig.t <= segment.t_end)
-    return u_sig.y[window], y_sig.y[window]
+def _estimator_disagreement(
+    unbiased: FrequencyResponse, direct: FrequencyResponse
+) -> tuple[float, float]:
+    """How far the direct estimate sits from the unbiased one, in dB and degrees.
+
+    Median rather than mean, over the bins both estimates call valid: a couple of
+    bins where the direct estimate diverges wildly say less about the flight than
+    a consistent offset across the band does.
+
+    This number does two jobs. Large values are a finding -- the log had enough
+    feedback in it to move the answer, and the user should see by how much. And
+    on a flight where the chirp dominates, the two *must* agree, which is what
+    tests the plant-input assembly: if we reconstructed the wrong plant input for
+    a mixer-injected sweep, this is where it shows up.
+    """
+    both = unbiased.valid_mask & direct.valid_mask
+    if not both.any():
+        return 0.0, 0.0
+    a, b = unbiased.H[both], direct.H[both]
+    usable = (np.abs(a) > 0.0) & (np.abs(b) > 0.0)
+    if not usable.any():
+        return 0.0, 0.0
+    ratio = b[usable] / a[usable]
+    return (
+        float(np.median(20.0 * np.log10(np.abs(ratio)))),
+        float(np.median(np.degrees(np.angle(ratio)))),
+    )
 
 
 def _delay_for(bundle: LogBundle, config: Config) -> LoopDelay:

@@ -7,6 +7,14 @@
 # A user override file is merged on top of this one; the resolved result is hashed
 # into Session.config_hash so a session's numbers are reproducible.
 
+[estimator]
+# The identification divides the loop out using an exogenous "instrument" -- the
+# injected chirp, or failing that the pilot's commanded attitude. Where the log
+# offers none, the estimate falls back to the direct one, which under feedback is
+# biased towards the inverse of the controller.
+bias_warn_db = 2.0    # direct vs unbiased disagreement above this -> ESTIMATOR_BIAS_LARGE
+bias_warn_deg = 10.0  # the same comparison in phase
+
 [coherence]
 threshold = 0.6              # project default; below this an FRF bin is not trusted
 min_valid_octaves = 1.0      # narrower than this around crossover -> COHERENCE_NARROW_BAND
