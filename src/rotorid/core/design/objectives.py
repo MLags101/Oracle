@@ -73,6 +73,11 @@ class DesignTargets:
     pm_floor_deg: float
     crossover_frac_of_loop: float
     conservatism: float = 0.5
+    #: Extra gain margin required because the aircraft was measured oscillating at
+    #: a frequency this model says has margin left. Not a preference and not tied
+    #: to the slider: it is the size of a demonstrated error in the model, so the
+    #: conservatism control cannot trade it away.
+    gm_holdback_db: float = 0.0
 
     def effective_pm_deg(self) -> float:
         """Phase-margin target after the conservatism slider, never below the floor.
@@ -83,6 +88,10 @@ class DesignTargets:
         """
         span = -10.0 + 25.0 * float(np.clip(self.conservatism, 0.0, 1.0))
         return max(self.pm_min_deg + span, self.pm_floor_deg)
+
+    def effective_gm_db(self) -> float:
+        """Gain-margin target after any measured-oscillation holdback."""
+        return self.gm_min_db + max(self.gm_holdback_db, 0.0)
 
     def crossover_scale(self) -> float:
         """How far the conservatism slider backs the crossover ceiling off.
@@ -248,7 +257,7 @@ def design_gains(
             # not: it needs the whole loop at every candidate crossover, which is
             # the single most expensive array in the design. So the cheap
             # constraints are applied first and only the survivors pay for it.
-            passes_margins = (pm >= pm_target) & (gm_db >= targets.gm_min_db)
+            passes_margins = (pm >= pm_target) & (gm_db >= targets.effective_gm_db())
             if not passes_margins.any():
                 ms_probe = np.full(pm.shape, -np.inf)
                 blockers.append(_worst_blocker(pm, gm_db, ms_probe, targets, pm_target))
@@ -293,7 +302,7 @@ def design_gains(
                 report = compute_margins(f_grid, candidate_kp * L1)
                 if (
                     report.phase_margin_deg < pm_target
-                    or report.gain_margin_db < targets.gm_min_db
+                    or report.gain_margin_db < targets.effective_gm_db()
                     or report.peak_sensitivity_db > targets.ms_max_db
                 ):
                     continue
@@ -302,7 +311,7 @@ def design_gains(
     if best is None:
         raise ValueError(
             "no gain set in the search space meets the margin constraints "
-            f"(PM >= {pm_target:.0f} deg, GM >= {targets.gm_min_db:.0f} dB, "
+            f"(PM >= {pm_target:.0f} deg, GM >= {targets.effective_gm_db():.0f} dB, "
             f"Ms <= {targets.ms_max_db:.0f} dB). The airframe or its filter chain, "
             "not the gains, is the problem."
         )
@@ -378,11 +387,22 @@ def _worst_blocker(
     best = int(np.argmax(pm))
     shortfalls = {
         "phase_margin": pm_target - float(pm[best]),
-        "gain_margin": targets.gm_min_db - float(gm_db[best]),
+        "gain_margin": targets.effective_gm_db() - float(gm_db[best]),
         "peak_sensitivity": float(ms_db[best]) - targets.ms_max_db,
     }
     name = max(shortfalls, key=lambda k: shortfalls[k])
     return shortfalls[name], name
+
+
+def _gain_margin_name(targets: DesignTargets) -> str:
+    """What to call the gain-margin constraint, given why it is where it is.
+
+    A user told "gain margin" is what stopped the tune will go looking for a
+    number in the config. When the binding number is a holdback measured off their
+    own aircraft's oscillation, that is a different fact and needs a different
+    name, or the explanation points at the wrong thing.
+    """
+    return "measured_oscillation" if targets.gm_holdback_db > 0.0 else "gain_margin"
 
 
 def _binding_constraint(
@@ -400,7 +420,8 @@ def _binding_constraint(
     """
     slack = {
         "phase_margin": (report.phase_margin_deg - pm_target) / max(pm_target, 1.0),
-        "gain_margin": (report.gain_margin_db - targets.gm_min_db) / max(targets.gm_min_db, 1.0),
+        _gain_margin_name(targets): (report.gain_margin_db - targets.effective_gm_db())
+        / max(targets.effective_gm_db(), 1.0),
         "peak_sensitivity": (targets.ms_max_db - report.peak_sensitivity_db)
         / max(targets.ms_max_db, 1.0),
         ceiling_reason: (ceiling_hz - designed_crossover_hz) / ceiling_hz,

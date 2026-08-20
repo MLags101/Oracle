@@ -23,6 +23,32 @@ bias_warn_deg = 10.0  # the same comparison in phase
 warn_m_s2 = 15.0
 blocker_m_s2 = 30.0
 
+[oscillation]
+# A sustained tone the aircraft produced and nobody commanded. Every threshold
+# here is a project default calibrated against the closed-loop simulator driven
+# into a limit cycle, because no published guidance states these numbers.
+f_min_hz = 4.0            # below this the pilot's own inputs live, and the outer
+                          # loop carries an oscillation back into the rate
+                          # setpoint, which is what the command test relies on
+                          # being absent
+min_excess_db = 8.0       # how far the line must stand above its local floor
+min_duty = 0.5            # fraction of the record it must be present over. On the
+                          # simulator a genuine limit cycle is present in 94-100%
+                          # of frames and a five-second burst in 24%, so this sits
+                          # in a wide gap rather than on a knife edge
+min_amplitude_frac = 0.05 # share of the total rate RMS the tone must account for
+# Measured rate power over commanded rate power in the band: the closed loop's
+# own magnitude at that frequency. A tune that tracks its command reads about
+# +2 dB on the simulator; every marginal one reads +11 to +20. Ten is also past
+# the 6 dB peak-sensitivity bound the designer enforces, so it is a threshold with
+# a meaning rather than one fitted to the fixture.
+min_amplification_db = 10.0
+# The model's claimed gain margin at the oscillation frequency is handed to the
+# designer as extra margin to hold back. Capped, because past this the model is
+# not describing the aircraft at all and backing the tune off is the wrong
+# response to that -- the blocker is.
+max_gm_holdback_db = 12.0
+
 [deconv]
 # Geometry for the measured step response, from Plasmatree's PID-Analyzer, which
 # has been extracting step responses from arbitrary blackbox flight data on these
@@ -104,6 +130,10 @@ deconv_floor_db = -20.0         # clamp |F| this far below unity when dividing o
 
 [noise]
 dterm_output_rms_limit_pct = 5.0   # project default: D output RMS as % of full motor range
+# Where the logged D term stops doing control work and starts converting noise
+# into motor heat. A multirotor rate loop crosses over between two and five
+# hertz, so ten is comfortably above anything the derivative is asked to do.
+dterm_measure_above_hz = 10.0
 peak_prominence_db = 6.0
 # A peak counts as RPM-tracking when the spectrogram carries this much more energy
 # along the frequency the motors would drag it to than along a fixed frequency.

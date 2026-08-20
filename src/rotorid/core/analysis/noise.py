@@ -45,6 +45,7 @@ __all__ = [
     "classify_peaks",
     "dterm_noise_rms",
     "find_spectral_peaks",
+    "measured_dterm_rms_pct",
     "motor_track",
     "noise_floor_db",
     "noise_profile",
@@ -526,6 +527,43 @@ def dterm_noise_rms(
     derivative = 2.0 * np.pi * f
     gain = abs(kd) * derivative * sensor * dterm
     return float(np.sqrt(np.trapezoid(psd_pre[band] * gain**2, f)))
+
+
+def measured_dterm_rms_pct(bundle: LogBundle, axis: Axis, *, above_hz: float) -> float | None:
+    """RMS of the *logged* derivative term above ``above_hz``, as a percentage.
+
+    :func:`dterm_noise_rms` predicts what a candidate chain and D gain would do to
+    the motors. This measures what the flown one actually did, from ``PIDR.D``,
+    and the two answer different questions: the prediction is about a tune nobody
+    has flown, and this is about the aircraft in front of you.
+
+    Only the content above ``above_hz`` is counted. A multirotor rate loop crosses
+    over somewhere between two and five hertz, so below that the derivative term
+    is doing control work and its magnitude is not a complaint. Above it the loop
+    has no authority left, and everything the D term sends to the motors up there
+    is noise being converted into heat.
+
+    Returns:
+        Percent of full motor range, RMS, or ``None`` if the log has no PID
+        messages -- which is a different statement from "the D term is quiet".
+    """
+    from rotorid.core.analysis.spectra import power_spectrum
+
+    key = f"rate.{axis}.d_term"
+    if key not in bundle.signals:
+        return None
+    signal = bundle.signals[key]
+    if signal.y.size < 256:
+        return None
+
+    nperseg = int(min(2 ** np.floor(np.log2(signal.y.size / 4.0)), 4096))
+    f_hz, psd = power_spectrum(signal.y, signal.rate_hz, nperseg=max(nperseg, 64))
+
+    ceiling = signal.native_nyquist_hz or f_hz[-1]
+    band = (f_hz >= above_hz) & (f_hz <= ceiling)
+    if band.sum() < 2:
+        return None
+    return float(np.sqrt(np.trapezoid(psd[band], f_hz[band]))) * 100.0
 
 
 # --------------------------------------------------------------------------- #

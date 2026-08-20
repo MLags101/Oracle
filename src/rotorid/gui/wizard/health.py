@@ -36,7 +36,13 @@ __all__ = ["HealthStage"]
 #: from the session rather than recomputed: a stage that re-ran the check could
 #: show a different verdict than the report, which is the one thing a health
 #: screen must never do.
-_GATING_CODES = ("ACCEL_CLIPPING", "VIBRATION_HIGH", "VIBRATION_LOW", "VIBRATION_NOT_LOGGED")
+_GATING_CODES = (
+    "OSCILLATION_DETECTED",
+    "ACCEL_CLIPPING",
+    "VIBRATION_HIGH",
+    "VIBRATION_LOW",
+    "VIBRATION_NOT_LOGGED",
+)
 
 _GATE_STYLE = {
     "blocker": "background:#7a1f1f; color:#ffffff; padding:8px; border-radius:4px;",

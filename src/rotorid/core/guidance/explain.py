@@ -744,6 +744,10 @@ _BINDING_PHRASE = {
     "peak_sensitivity": "the sensitivity peak limit",
     "identified_band": "the top of the identified band -- beyond it the model is extrapolating",
     "delay_limit": "the delay in the airframe and actuation",
+    "measured_oscillation": (
+        "the extra gain margin held back because this aircraft was measured oscillating at a "
+        "frequency the model says still had margin"
+    ),
 }
 
 

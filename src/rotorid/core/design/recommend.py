@@ -28,7 +28,13 @@ from rotorid.config import Config
 from rotorid.core.analysis.deconv import MeasuredStep, measured_step
 from rotorid.core.analysis.instrument import Rung, choose_instrument, windowed_signals
 from rotorid.core.analysis.margins import LoopDelay, design_grid, loop_delay
-from rotorid.core.analysis.noise import MotorTrack, motor_track, noise_profile
+from rotorid.core.analysis.noise import (
+    MotorTrack,
+    measured_dterm_rms_pct,
+    motor_track,
+    noise_profile,
+)
+from rotorid.core.analysis.oscillation import Oscillation, detect_oscillation, model_optimism_db
 from rotorid.core.analysis.spectra import (
     InstrumentedEstimate,
     SpectralEstimate,
@@ -133,6 +139,15 @@ class AxisAnalysis:
     #: when the log could not support one -- which is a different statement from
     #: a flat step, and the two are never allowed to look alike.
     measured: MeasuredStep | None = None
+    #: RMS of the logged derivative term above the control band, as a percentage
+    #: of full motor range. Measured, where ``TuneRecommendation.dterm_noise_rms_pct``
+    #: is predicted for a tune nobody has flown. ``None`` when the log carries no
+    #: PID messages, which is not the same as a quiet D term.
+    dterm_measured_pct: float | None = None
+    #: A sustained tone the aircraft produced and nobody commanded. Carries how
+    #: much gain margin this model wrongly claims at that frequency, which is what
+    #: the design is made to hold back.
+    oscillation: Oscillation | None = None
     #: What this model predicts the step would have been *under the gains the log
     #: was flown with*, over exactly the window ``measured`` covers. Not the
     #: recommended gains: comparing the flown response against a prediction for a
@@ -290,6 +305,10 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     # have two hundred usable steps outside it.
     measured = measured_step(bundle, axis, config)
     delay = _delay_for(bundle, config)
+    oscillation = _oscillation_for(bundle, axis, config, airframe, chain, delay, op, noise)
+    dterm_measured = measured_dterm_rms_pct(
+        bundle, axis, above_hz=config.float_("noise", "dterm_measure_above_hz")
+    )
     flown_prediction = (
         _flown_prediction(bundle, axis, airframe, chain, delay, op, measured)
         if measured is not None
@@ -309,7 +328,42 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
         track=track,
         measured=measured,
         flown_prediction=flown_prediction,
+        oscillation=oscillation,
+        dterm_measured_pct=dterm_measured,
     )
+
+
+def _oscillation_for(
+    bundle: LogBundle,
+    axis: Axis,
+    config: Config,
+    airframe: AirframeModel,
+    chain: FilterChain,
+    delay: LoopDelay,
+    op: OperatingPoint,
+    noise: NoiseProfile | None,
+) -> Oscillation | None:
+    """Detect a sustained oscillation and price the model's error against it.
+
+    The optimism figure is computed against the gains the aircraft was *flying*,
+    because that is the loop that produced the oscillation. Measuring it against
+    the recommended gains would be asking how wrong a tune nobody has flown is.
+    """
+    found = detect_oscillation(bundle, axis, config, noise=noise, gyro_lpf_hz=chain.gyro_lpf_hz)
+    if found is None:
+        return None
+    try:
+        flown = gains_from_bundle(bundle, axis)
+    except (KeyError, ValueError):
+        return found
+    optimism = model_optimism_db(
+        found.f_hz,
+        controller_for(bundle.stack, flown, chain),
+        airframe,
+        delay=delay,
+        op=op,
+    )
+    return replace(found, model_optimism_db=optimism)
 
 
 def _flown_prediction(
@@ -377,6 +431,17 @@ def recommend_from(
         pm_floor_deg=config.float_("margins", "pm_floor_deg"),
         crossover_frac_of_loop=config.float_("margins", "crossover_frac_of_loop"),
         conservatism=conservatism,
+        # A measured oscillation is evidence that this model is optimistic by a
+        # known number of decibels at a known frequency. Requiring that much more
+        # gain margin is the only response that follows from the evidence: a tool
+        # that measures an oscillating aircraft and then recommends more gain has
+        # not understood what it measured. Capped, because past the cap the model
+        # is not describing the aircraft at all and the blocker is the right
+        # answer rather than a softer tune.
+        gm_holdback_db=min(
+            analysis.oscillation.model_optimism_db if analysis.oscillation else 0.0,
+            config.float_("oscillation", "max_gm_holdback_db"),
+        ),
     )
     band = analysis.deconvolved.valid_band_hz
     f_grid = design_grid(min(band[0], 0.1), max(band[1] * 4.0, 100.0))

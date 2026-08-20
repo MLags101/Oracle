@@ -277,6 +277,75 @@ def check_vibration(context: GuidanceContext) -> list[Finding]:
     ]
 
 
+def check_oscillation(context: GuidanceContext) -> list[Finding]:
+    """Whether the aircraft was already oscillating when the log was recorded.
+
+    A blocker, and the reason is worth stating precisely. An aircraft in a limit
+    cycle has a real loop with unity gain and inverted phase somewhere. A model
+    fitted to that flight can still come back with comfortable margins, because
+    the frequency response it was fitted over is dominated by the excitation
+    rather than by the limit cycle. Without this check the tool would look at an
+    oscillating vehicle, see a healthy model, and recommend more gain.
+    """
+    out: list[Finding] = []
+    for axis in context.axes():
+        found = context.analyses[axis].oscillation
+        if found is None:
+            continue
+
+        # Two quite different situations, and they need different words. Either
+        # the model agrees the flown loop was at its limit -- in which case the
+        # identification is sound and the flown tune was simply too hot -- or the
+        # model says there was margin left, which means the model is wrong.
+        optimistic = found.model_optimism_db > 1.0
+        out.append(
+            Finding(
+                severity="blocker",
+                code="OSCILLATION_DETECTED",
+                title=(
+                    f"{axis}: oscillating at {found.f_hz:.0f} Hz for {found.duty:.0%} of the flight"
+                ),
+                detail=(
+                    f"A tone at {found.f_hz:.1f} Hz stands {found.excess_db:.0f} dB above the "
+                    f"local noise floor in the measured {axis} rate, accounts for "
+                    f"{found.amplitude_frac:.0%} of the aircraft's total {axis} motion, and is "
+                    f"present over {found.duty:.0%} of the record. The loop answers a command "
+                    f"at that frequency with {found.amplification_db:.0f} dB more output than "
+                    f"input, so the aircraft is not tracking there -- it is ringing. "
+                    + (
+                        f"This model claims {found.model_optimism_db:.0f} dB of gain margin at "
+                        f"that frequency, so the aircraft is demonstrating that the model is "
+                        f"wrong by at least that much. The design has been made to hold that "
+                        f"margin back, but a model contradicted by the aircraft is a model to "
+                        f"be suspicious of everywhere, not only here."
+                        if optimistic
+                        else "This model agrees the flown loop had no margin left at that "
+                        "frequency, so the identification and the aircraft are telling the "
+                        "same story: the gains that were flown were too high."
+                    )
+                ),
+                action=(
+                    f"Reduce the flown {axis} gains -- ArduPilot's guidance is to halve them -- "
+                    f"and re-fly before using anything from this log. If the tone is near a "
+                    f"motor or frame frequency, check the notch configuration first: a "
+                    f"filter chasing the wrong line leaves the loop with less phase than the "
+                    f"design assumed."
+                ),
+                evidence={
+                    "f_hz": found.f_hz,
+                    "excess_db": found.excess_db,
+                    "duty": found.duty,
+                    "amplitude_rad_s": found.amplitude_rad_s,
+                    "amplitude_frac": found.amplitude_frac,
+                    "amplification_db": found.amplification_db,
+                    "model_optimism_db": found.model_optimism_db,
+                },
+                plot_hint="spectrum",
+            )
+        )
+    return out
+
+
 def check_step_response(context: GuidanceContext) -> list[Finding]:
     """Whether the model reproduces the step the aircraft actually flew.
 
@@ -905,6 +974,56 @@ def check_dterm_noise(context: GuidanceContext) -> list[Finding]:
     return out
 
 
+def check_measured_dterm_noise(context: GuidanceContext) -> list[Finding]:
+    """What the derivative term was measured doing, not what it is predicted to do.
+
+    Separate from :func:`check_dterm_noise` and deliberately so. That one is about
+    the tune being recommended and is only as right as the noise model behind it;
+    this one is about the aircraft that flew, and needs no model at all. When they
+    disagree, the measurement is the one to believe.
+    """
+    limit = context.config.float_("noise", "dterm_output_rms_limit_pct")
+    above = context.config.float_("noise", "dterm_measure_above_hz")
+    out: list[Finding] = []
+    for axis in context.axes():
+        measured = context.analyses[axis].dterm_measured_pct
+        if measured is None or not np.isfinite(measured) or measured <= limit:
+            continue
+        rec = context.recommendations.get(axis)
+        predicted = rec.dterm_noise_rms_pct if rec is not None else float("nan")
+        out.append(
+            Finding(
+                severity="warning",
+                code="DTERM_NOISE_MEASURED",
+                title=f"{axis}: the flown D term put {measured:.1f}% noise into the motors",
+                detail=(
+                    f"Above {above:.0f} Hz the logged {axis} derivative term has an RMS of "
+                    f"{measured:.1f}% of full motor range, against a {limit:.0f}% limit. The "
+                    f"loop has no authority up there, so none of that is control -- it is "
+                    f"heat in the motors and ESCs, and it is what makes an over-filtered or "
+                    f"over-D'd vehicle feel harsh. This is measured from PIDR rather than "
+                    f"predicted, so it stands whatever the noise model says."
+                    + (
+                        ""
+                        if not np.isfinite(predicted)
+                        else f" The recommended tune is predicted to produce {predicted:.1f}%."
+                    )
+                ),
+                action=(
+                    f"Fix the noise mechanically first -- balance, mounts, isolation. If it "
+                    f"is already as clean as it will get, lower {_d_gain_name(context)}. "
+                    f"Filtering it away costs phase and buys back less than it removes."
+                ),
+                evidence={
+                    "measured_pct": measured,
+                    "limit_pct": limit,
+                    "above_hz": above,
+                },
+            )
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Nonlinear controller behaviour, which the LTI model cannot see
 # --------------------------------------------------------------------------- #
@@ -1069,6 +1188,7 @@ def _ratio(new: float, old: float) -> float:
 CHECKS: tuple[Check, ...] = (
     check_vibration,
     check_clipping,
+    check_oscillation,
     check_step_response,
     check_excitation,
     check_identification_band,
@@ -1082,6 +1202,7 @@ CHECKS: tuple[Check, ...] = (
     check_structural_resonance,
     check_gyro_lpf_separation,
     check_dterm_noise,
+    check_measured_dterm_noise,
     check_slew_limiter,
     check_integrator_windup,
     check_gain_step_size,
