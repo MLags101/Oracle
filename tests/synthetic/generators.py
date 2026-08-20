@@ -21,6 +21,7 @@ from scipy.signal import lfilter
 from rotorid.core.analysis.model_eval import airframe_response
 from rotorid.core.filters.chain import FilterChain, OperatingPoint
 from rotorid.core.filters.harmonic import HarmonicNotch
+from rotorid.core.io.base import canonical_signal
 from rotorid.core.types import AXES, AirframeModel, Axis, LogBundle, Signal, Stack
 
 FloatArray = NDArray[np.float64]
@@ -30,6 +31,7 @@ __all__ = [
     "make_airframe",
     "make_bundle",
     "make_chain",
+    "make_general_flight_bundle",
     "make_noise_bundle",
     "motor_noise",
     "simulate_airframe",
@@ -420,6 +422,130 @@ def swept_tones(
     for n, a in zip(harmonics, amplitudes, strict=False):
         out += a * np.sin(n * phase + rng.uniform(0.0, 2.0 * np.pi))
     return np.asarray(out, dtype=np.float64)
+
+
+def make_general_flight_bundle(
+    airframe: AirframeModel,
+    chain: FilterChain,
+    *,
+    axis: Axis = "roll",
+    n_bursts: int = 5,
+    burst_s: float = 12.0,
+    quiet_s: float = 6.0,
+    f_start_hz: float = 0.3,
+    f_stop_hz: float = 12.0,
+    amplitude: float = 0.12,
+    loop_rate_hz: float = 400.0,
+    throttles: tuple[float, ...] = (0.30, 0.68, 0.42, 0.80, 0.55),
+    gain_per_throttle: float = 0.0,
+    voltage_start: float = 16.8,
+    voltage_end: float = 14.4,
+    hover_hz: float = 50.0,
+    gains: tuple[float, float, float] = (0.135, 0.135, 0.0036),
+    path: str = "synthetic-general.bin",
+) -> LogBundle:
+    """An ordinary flight: several bursts of single-axis stick work, no sweep record.
+
+    This is the fixture the general-flight path is written against, and it is
+    deliberately not a chopped-up sweep. What makes an ordinary flight a
+    different kind of evidence is that each burst happens somewhere else in the
+    envelope -- a different throttle, a lower pack voltage -- which is both why
+    its band is narrow and why it can say something a sweep cannot.
+
+    Args:
+        gain_per_throttle: Fractional change in airframe ``K`` per unit throttle.
+            ``0.0`` is a perfectly linearized vehicle. ``0.6`` is one whose thrust
+            curve is badly mis-set, which is what spec 5.9 exists to detect.
+        throttles: One per burst, so ``n_bursts`` bursts visit ``n_bursts`` points.
+            Deliberately not in ascending order: pack voltage falls monotonically
+            through any flight, so an ascending throttle schedule would make
+            throttle and voltage almost perfectly anti-correlated and no analysis
+            could tell which of them the gain was tracking.
+    """
+    from pathlib import Path
+
+    fs = chain.sample_rate_hz
+    step_samples = round(fs * (burst_s + quiet_s))
+    total = n_bursts * step_samples
+    t = np.arange(total, dtype=np.float64) / fs
+
+    u = np.zeros(total, dtype=np.float64)
+    y = np.zeros(total, dtype=np.float64)
+    throttle_track = np.zeros(total, dtype=np.float64)
+    for index in range(n_bursts):
+        start = index * step_samples
+        n_burst = round(fs * burst_s)
+        throttle = throttles[index % len(throttles)]
+        throttle_track[start : start + step_samples] = throttle
+
+        _, burst = chirp(
+            sample_rate_hz=fs,
+            duration_s=burst_s,
+            f_start_hz=f_start_hz,
+            f_stop_hz=f_stop_hz,
+            amplitude=amplitude,
+            fade_s=min(2.0, burst_s / 4.0),
+        )
+        burst = burst[:n_burst]
+        # The airframe this burst was flown through, not the one the flight
+        # averages to. A test that scaled the *response* instead would be
+        # measuring the fixture's arithmetic rather than the analysis.
+        scale = 1.0 + gain_per_throttle * (throttle - float(np.mean(throttles)))
+        at_this_point = replace(
+            airframe, params={**airframe.params, "K": airframe.params["K"] * scale}
+        )
+        response = simulate_effective(
+            burst, fs, at_this_point, chain, op=OperatingPoint(motor_hz=(hover_hz,))
+        )
+        u[start : start + n_burst] = burst
+        y[start : start + n_burst] = response
+
+    log_step = round(fs / loop_rate_hz)
+    t_log, u_log, y_log = t[::log_step], u[::log_step], y[::log_step]
+
+    signals = _sweep_signals(axis, t_log, u_log, y_log, excite=False)
+    signals["motor.1.output"] = canonical_signal(
+        "motor.1.output",
+        t_log,
+        1000.0 + 1000.0 * throttle_track[::log_step],
+        source_msg="RCOU",
+    )
+    signals["batt.voltage"] = canonical_signal(
+        "batt.voltage",
+        t_log,
+        np.linspace(voltage_start, voltage_end, t_log.size),
+        source_msg="BAT",
+    )
+
+    kp, ki, kd = gains
+    suffix = {"roll": "RLL", "pitch": "PIT", "yaw": "YAW"}[axis]
+    params: dict[str, float] = {
+        "SCHED_LOOP_RATE": loop_rate_hz,
+        "INS_GYRO_RATE": float(int(np.log2(fs / 1000.0))),
+        "INS_GYRO_FILTER": chain.gyro_lpf_hz or 0.0,
+        "MOT_PWM_TYPE": 6.0,
+        "MOT_SPIN_MIN": 0.0,
+        "MOT_SPIN_MAX": 1.0,
+        f"ATC_RAT_{suffix}_P": kp,
+        f"ATC_RAT_{suffix}_I": ki,
+        f"ATC_RAT_{suffix}_D": kd,
+    }
+    if chain.dterm_lpf_hz:
+        params[f"ATC_RAT_{suffix}_FLTD"] = chain.dterm_lpf_hz
+
+    return LogBundle(
+        path=Path(path),
+        stack="ardupilot",
+        firmware_version="ArduCopter V4.5.0 (synthetic general flight)",
+        board_id=None,
+        frame_info={},
+        sample_rate_hz=loop_rate_hz,
+        loop_rate_hz=loop_rate_hz,
+        gyro_sample_rate_hz=fs,
+        signals=signals,
+        params=params,
+        declared_kind="general",
+    )
 
 
 def make_noise_bundle(

@@ -34,6 +34,7 @@ from rotorid.core.analysis.noise import (
     motor_track,
     noise_profile,
 )
+from rotorid.core.analysis.operating_point import OperatingPointSpread, gain_spread
 from rotorid.core.analysis.oscillation import Oscillation, detect_oscillation, model_optimism_db
 from rotorid.core.analysis.spectra import (
     InstrumentedEstimate,
@@ -150,6 +151,11 @@ class AxisAnalysis:
     #: much gain margin this model wrongly claims at that frequency, which is what
     #: the design is made to hold back.
     oscillation: Oscillation | None = None
+    #: How far the airframe gain moved between segments, and what it moved with
+    #: (spec 5.9). ``None`` on a log whose kind cannot support the measurement --
+    #: which is a different statement from a vehicle that held still, and the two
+    #: are never allowed to look alike.
+    spread: OperatingPointSpread | None = None
     #: What this model predicts the step would have been *under the gains the log
     #: was flown with*, over exactly the window ``measured`` covers. Not the
     #: recommended gains: comparing the flown response against a prediction for a
@@ -191,6 +197,10 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     # both the bias diagnostic and the check on the plant-input assembly.
     iv_estimates: list[InstrumentedEstimate] = []
     direct_estimates: list[SpectralEstimate] = []
+    # Kept per segment as well as summed. The sum is the identification; these
+    # are what says whether the aircraft the sum describes was the same aircraft
+    # throughout (spec 5.9).
+    by_segment: dict[ExcitationSegment, SpectralEstimate | InstrumentedEstimate] = {}
     rungs: set[Rung] = set()
     summed = False
     for segment in segments:
@@ -203,29 +213,29 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
             continue
         rungs.add(cut.rung)
         summed = summed or cut.summed_injection
-        direct_estimates.append(
-            estimate_frf(
+        direct = estimate_frf(
+            cut.plant_input,
+            cut.response,
+            fs,
+            nperseg=nperseg,
+            input_signal=cut.input_key,
+            output_signal=cut.output_key,
+        )
+        direct_estimates.append(direct)
+        by_segment[segment] = direct
+        if cut.instrument is not None and cut.instrument_key is not None:
+            instrumented = estimate_frf_iv(
+                cut.instrument,
                 cut.plant_input,
                 cut.response,
                 fs,
                 nperseg=nperseg,
+                instrument_signal=cut.instrument_key,
                 input_signal=cut.input_key,
                 output_signal=cut.output_key,
             )
-        )
-        if cut.instrument is not None and cut.instrument_key is not None:
-            iv_estimates.append(
-                estimate_frf_iv(
-                    cut.instrument,
-                    cut.plant_input,
-                    cut.response,
-                    fs,
-                    nperseg=nperseg,
-                    instrument_signal=cut.instrument_key,
-                    input_signal=cut.input_key,
-                    output_signal=cut.output_key,
-                )
-            )
+            iv_estimates.append(instrumented)
+            by_segment[segment] = instrumented
     if not direct_estimates:
         raise ValueError(
             f"every {axis} segment is too short to resolve {f_lowest:g} Hz; "
@@ -289,6 +299,10 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     # whether it is describing the aircraft or its controller.
     airframe = replace(airframe, estimator=estimator, instrument=effective.instrument)
 
+    spread = _operating_point_spread(bundle, airframe, by_segment, chain, config, band, threshold)
+    if spread is not None:
+        airframe = replace(airframe, gain_spread_pct=spread.spread_pct)
+
     noise, track = _noise_for(bundle, axis, segments, chain, op, config, ceiling)
 
     # Over the whole record, not the identification segments. Identification wants
@@ -319,10 +333,93 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
         noise=noise,
         track=track,
         measured=measured,
+        spread=spread,
         flown_prediction=flown_prediction,
         oscillation=oscillation,
         dterm_measured_pct=dterm_measured,
     )
+
+
+def _spread_holdback(spread: OperatingPointSpread | None, config: Config) -> float:
+    """Extra conservatism bought by a vehicle whose gain moves (spec 5.9).
+
+    Ramped rather than stepped, because the underlying quantity is continuous and
+    a threshold would make two nearly identical flights produce visibly different
+    tunes. Zero below the warning level: every vehicle's gain moves a little, and
+    charging for the ordinary case would just be a quieter default.
+    """
+    if spread is None:
+        return 0.0
+    warn = config.float_("operating_point", "warn_spread_pct")
+    severe = config.float_("operating_point", "severe_spread_pct")
+    bonus = config.float_("operating_point", "max_conservatism_bonus")
+    if spread.spread_pct <= warn or severe <= warn:
+        return 0.0
+    return bonus * min((spread.spread_pct - warn) / (severe - warn), 1.0)
+
+
+def _operating_point_spread(
+    bundle: LogBundle,
+    airframe: AirframeModel,
+    by_segment: dict[ExcitationSegment, SpectralEstimate | InstrumentedEstimate],
+    chain: FilterChain,
+    config: Config,
+    band: tuple[float, float],
+    coherence_threshold: float,
+) -> OperatingPointSpread | None:
+    """How far the airframe gain moved between segments (spec 5.9).
+
+    Only for a log whose kind offers it. A sweep is flown at one throttle on one
+    battery state, so its "spread" would be three measurements of the same
+    operating point differing by fit noise -- a number that looks like physics
+    and is not.
+
+    Each segment is deconvolved at *its own* operating point, so a notch that
+    tracked throttle across the flight is divided out where it actually sat
+    rather than where the hover average puts it.
+    """
+    if not capabilities(bundle.kind).allows("operating_point"):
+        return None
+
+    plants: dict[ExcitationSegment, DeconvolvedPlant] = {}
+    throttle: dict[ExcitationSegment, float] = {}
+    voltage: dict[ExcitationSegment, float] = {}
+    floor_db = config.float_("filters", "deconv_floor_db")
+    for segment, estimate in by_segment.items():
+        op = hover_operating_point(bundle, segment.t_start, segment.t_end)
+        frf = estimate.to_frf(coherence_threshold=coherence_threshold, band_hz=band)
+        try:
+            plants[segment] = deconvolve(
+                EffectivePlant(
+                    axis=segment.axis,
+                    frf=frf,
+                    filters_included=True,
+                    source="mixer_cmd",
+                ),
+                chain,
+                op=op,
+                floor_db=floor_db,
+            )
+        except ValueError:
+            continue
+        if op.throttle is not None:
+            throttle[segment] = op.throttle
+        mean_voltage = _mean_over(bundle, "batt.voltage", segment.t_start, segment.t_end)
+        if mean_voltage is not None:
+            voltage[segment] = mean_voltage
+
+    return gain_spread(airframe, plants, throttle=throttle, voltage=voltage)
+
+
+def _mean_over(bundle: LogBundle, key: str, t_start: float, t_end: float) -> float | None:
+    """Mean of one signal over a window, or ``None`` if the log has no such signal."""
+    signal = bundle.signals.get(key)
+    if signal is None:
+        return None
+    window = (signal.t >= t_start) & (signal.t <= t_end)
+    if not window.any():
+        return None
+    return float(np.mean(signal.y[window]))
 
 
 def _nothing_to_identify(bundle: LogBundle, axis: Axis) -> str:
@@ -463,6 +560,7 @@ def recommend_from(
     # Raised here rather than at the call site because the sandbox, the CLI and
     # the report all call this and would each have to remember.
     conservatism = max(conservatism, capabilities(bundle.kind).conservatism_floor)
+    conservatism = min(1.0, conservatism + _spread_holdback(analysis.spread, config))
 
     targets = DesignTargets(
         pm_min_deg=config.float_("margins", "pm_min_deg"),
@@ -699,6 +797,14 @@ def _confidence(analysis: AxisAnalysis, config: Config, kind: LogKind) -> Confid
     poor_fit = model.fit_rms_db > config.float_("fit", "max_rms_db") or (
         model.fit_rms_deg > config.float_("fit", "max_rms_deg")
     )
+    # A vehicle whose gain moves across the envelope has not been identified
+    # badly -- it has been identified at one point, and the tune is about all of
+    # them. That is a statement about confidence, not about fit quality.
+    if analysis.spread is not None and analysis.spread.spread_pct > config.float_(
+        "operating_point", "severe_spread_pct"
+    ):
+        return "low"
+
     if poor_fit or excitation < 0.5 or octaves < config.float_("coherence", "min_valid_octaves"):
         rating: Confidence = "low"
     elif excitation < 1.0 or model.coherence_mean < 0.8:

@@ -49,6 +49,23 @@ min_amplification_db = 10.0
 # response to that -- the blocker is.
 max_gm_holdback_db = 12.0
 
+[operating_point]
+# Airframe gain moves with throttle, pack voltage, payload and prop condition
+# (spec 5.9). These are project defaults: no firmware document states them,
+# because no firmware measures the quantity. They are set against what the
+# closed-loop simulator produces when MOT_THST_EXPO is deliberately mismatched --
+# a correctly compensated thrust curve holds the spread inside 15%, and a badly
+# mismatched one runs to 40-60%.
+warn_spread_pct = 20.0    # above this the vehicle is not one plant, and the
+                          # design is told so rather than being tuned to a margin
+                          # that only holds at hover
+severe_spread_pct = 50.0  # above this a single-operating-point tune is not a
+                          # meaningful object; confidence is capped at low
+# Extra conservatism a spread buys, ramped linearly from warn to severe. Holding
+# margin back is the only response that follows from the evidence: the model is
+# right at one point in the envelope and the aircraft is flown across all of it.
+max_conservatism_bonus = 0.3
+
 [deconv]
 # Geometry for the measured step response, from Plasmatree's PID-Analyzer, which
 # has been extracting step responses from arbitrary blackbox flight data on these

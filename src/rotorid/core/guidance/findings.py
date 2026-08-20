@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from rotorid.config import Config
+from rotorid.core.analysis.operating_point import OperatingPointSpread
 from rotorid.core.analysis.sysid import check_filter_model
 from rotorid.core.analysis.vibration import VibrationSummary, vibration_summary
 from rotorid.core.design.recommend import AxisAnalysis
@@ -1233,6 +1234,133 @@ def check_gain_step_size(context: GuidanceContext) -> list[Finding]:
     return out
 
 
+def check_operating_point(context: GuidanceContext) -> list[Finding]:
+    """Whether the vehicle the model describes was the same vehicle throughout.
+
+    A gain spread is not a fit problem and must not read as one. The
+    identification can be excellent and the aircraft still be a different plant
+    at 70% throttle than at hover, and the response to that is compensation --
+    thrust linearization, battery scaling -- rather than a different tune.
+    """
+    out: list[Finding] = []
+    warn = context.config.float_("operating_point", "warn_spread_pct")
+    severe = context.config.float_("operating_point", "severe_spread_pct")
+    for axis in context.axes():
+        spread = context.analyses[axis].spread
+        if spread is None:
+            continue
+        evidence = {
+            "spread_pct": round(spread.spread_pct, 1),
+            "n_operating_points": float(len(spread.samples)),
+        }
+        if spread.throttle_r is not None:
+            evidence["throttle_r"] = round(spread.throttle_r, 2)
+        if spread.voltage_r is not None:
+            evidence["voltage_r"] = round(spread.voltage_r, 2)
+
+        if spread.spread_pct <= warn:
+            out.append(
+                Finding(
+                    severity="good",
+                    code="OPERATING_POINT_STABLE",
+                    title=f"{axis}: gain holds across the envelope",
+                    detail=(
+                        f"The {axis} airframe gain varied {spread.spread_pct:.0f}% across "
+                        f"{len(spread.samples)} operating points in this flight. A tune "
+                        f"designed at one of them is a tune that holds at the others."
+                    ),
+                    action="Nothing.",
+                    evidence=evidence,
+                    plot_hint="operating_point",
+                )
+            )
+            continue
+
+        if spread.attributed_to_throttle and spread.attributed_to_voltage:
+            detail_tail = (
+                f"It tracks throttle (r = {spread.throttle_r:+.2f}) and pack voltage "
+                f"(r = {spread.voltage_r:+.2f}) about equally well, and in this flight "
+                f"those two moved together -- so which of them is the cause cannot be "
+                f"read off this log."
+            )
+            action = (
+                "Fly again holding one of the two roughly constant: a flight at steady "
+                "throttle separates the voltage effect, and a flight on a fresh pack "
+                "separates the thrust curve."
+            )
+        elif spread.attributed_to_throttle:
+            detail_tail = (
+                f"It moves with throttle (r = {spread.throttle_r:+.2f}), which is what an "
+                f"uncompensated or mis-set thrust curve looks like: the same stick "
+                f"deflection buys a different angular acceleration at different power."
+            )
+            action = (
+                "Check MOT_THST_EXPO against your propeller and motor combination"
+                if context.bundle.stack == "ardupilot"
+                else "Check THR_MDL_FAC against your propeller and motor combination"
+            ) + ", then re-fly. Until it is right, no single set of gains is correct."
+        elif spread.attributed_to_voltage:
+            detail_tail = (
+                f"It moves with pack voltage (r = {spread.voltage_r:+.2f}), so the vehicle "
+                f"is a different plant at the end of the flight than at the start."
+            )
+            action = (
+                "Enable battery voltage compensation (MOT_BAT_VOLT_MAX / MOT_BAT_VOLT_MIN) "
+                if context.bundle.stack == "ardupilot"
+                else "Enable battery-scaled thrust compensation "
+            ) + "and re-fly, so one tune covers the whole pack."
+        else:
+            detail_tail = (
+                "Nothing this log measured explains it -- not throttle, not pack voltage. "
+                "Payload changes, a damaged propeller or a loose arm all produce this."
+            )
+            action = (
+                "Fly again with the vehicle in one configuration throughout. If the spread "
+                "persists, look for something mechanical before trusting any tune."
+            )
+
+        out.append(
+            Finding(
+                severity="warning",
+                code=_spread_code(spread),
+                title=(f"{axis}: airframe gain moved {spread.spread_pct:.0f}% across the flight"),
+                detail=(
+                    f"Measured over {len(spread.samples)} segments at different points in "
+                    f"the envelope, holding the identified shape fixed and letting only "
+                    f"the gain move. {detail_tail}"
+                    + (
+                        " That is past the point where a single-operating-point tune means "
+                        "much, so the confidence on this axis is capped at low."
+                        if spread.spread_pct > severe
+                        else " The design holds extra margin back to cover it."
+                    )
+                ),
+                action=action,
+                evidence=evidence,
+                plot_hint="operating_point",
+                doc_link=_doc(context),
+            )
+        )
+    return out
+
+
+def _spread_code(spread: OperatingPointSpread) -> str:
+    """Which finding a gain spread is, by what the log can actually attribute it to.
+
+    Two strong correlations do not make a stronger claim than one -- they make a
+    weaker one, because the log cannot separate them. So the specific codes are
+    reserved for the case where exactly one variable explains the spread, and
+    everything else is the honest generic.
+    """
+    if spread.attributed_to_throttle and spread.attributed_to_voltage:
+        return "OPERATING_POINT_SPREAD"
+    if spread.attributed_to_throttle:
+        return "THRUST_LINEARIZATION_SUSPECT"
+    if spread.attributed_to_voltage:
+        return "BATTERY_SAG_LARGE"
+    return "OPERATING_POINT_SPREAD"
+
+
 def check_confidence(context: GuidanceContext) -> list[Finding]:
     """A low-confidence recommendation must be acknowledged, not merely noticed."""
     out: list[Finding] = []
@@ -1303,5 +1431,6 @@ CHECKS: tuple[Check, ...] = (
     check_slew_limiter,
     check_integrator_windup,
     check_gain_step_size,
+    check_operating_point,
     check_confidence,
 )
