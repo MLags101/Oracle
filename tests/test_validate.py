@@ -411,3 +411,42 @@ def test_a_recommendation_can_be_re_solved_without_re_identifying(before: LogBun
     second = recommend_from(analysis, before, CONFIG)
     assert first.gains.kp == pytest.approx(second.gains.kp)
     assert np.isfinite(first.predicted_step.rise_time_s)
+
+
+def test_a_re_flown_recommendation_is_confirmed_against_the_aircraft(before: LogBundle) -> None:
+    """The end-to-end claim M10 exists to make, on a vehicle we control exactly.
+
+    Recommend gains from one flight, fly the *same simulated airframe* again with
+    those gains, and the predicted step has to match the one deconvolved from the
+    new flight. Nothing about that is guaranteed by construction: the prediction
+    comes from a fitted model driven through the controller model, and the
+    measurement comes from a regularized deconvolution of a closed-loop
+    simulation. They agree only if the identification, the controller model and
+    the step recovery are all right at once, which is exactly the claim.
+
+    Every other fixture in this file relabels the before-flight's parameters,
+    which tests how the report treats what it finds. This one actually flies it.
+    """
+    session = analyze(before, ("roll",), CONFIG, tool_version=__version__).session
+    gains = session.recommendations["roll"].gains
+
+    reflown = make_closed_loop_bundle(path="after.bin", gains=(gains.kp, gains.ki, gains.kd))
+    report = compare_logs(
+        before,
+        reflown,
+        CONFIG,
+        tool_version=__version__,
+        session=session,
+        axes=("roll",),
+    )
+    comparison = report.axes["roll"]
+    assert comparison.applied is True, "the re-flown log has to be flying the recommendation"
+    assert comparison.after_step is not None
+    assert comparison.prediction_holds is True, (
+        f"rise ratio {comparison.rise_ratio}, "
+        f"measured overshoot {comparison.after_step.metrics.overshoot_pct:.1f}%, "
+        f"predicted {comparison.predicted_step.overshoot_pct:.1f}%"
+        if comparison.predicted_step
+        else ""
+    )
+    assert "PREDICTION_CONFIRMED" in {f.code for f in validation_findings(report)}

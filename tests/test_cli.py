@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from rotorid import cli
+from rotorid.config import load_config
 from tests.synthetic.generators import make_airframe, make_bundle, make_chain
 
 
@@ -311,6 +312,39 @@ def test_filters_reports_the_noise_without_designing_a_tune(
     assert "roll" in payload["axes"]
     assert "peaks" in payload["axes"]["roll"]
     assert "gains" not in json.dumps(payload)
+
+
+def test_filters_works_on_a_log_that_cannot_be_identified_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The noise does not need a model of the aircraft, so it must not need one.
+
+    A user whose log has nothing identifiable in it is exactly the user who most
+    needs to be told their notch is chasing the wrong line, and refusing the half
+    that was possible because the other half was not would be the wrong trade.
+    """
+    from rotorid.core.design.recommend import identify_axis
+
+    path = tmp_path / "unidentifiable.bin"
+    path.write_bytes(b"")
+    bundle = replace(
+        make_bundle(make_airframe(), make_chain(), with_motor_noise=True),
+        declared_kind="tuning",
+        signals={
+            k: v
+            for k, v in make_bundle(
+                make_airframe(), make_chain(), with_motor_noise=True
+            ).signals.items()
+            if not k.startswith("excite.")
+        },
+    )
+    monkeypatch.setattr(cli, "_read", lambda p, kind=None: bundle)
+    with pytest.raises(ValueError):
+        identify_axis(bundle, "roll", load_config())
+
+    assert cli.main(["filters", str(path), "--axes", "roll", "--json"]) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["axes"]["roll"]["peaks"]
 
 
 def test_profile_writes_a_file_that_says_what_it_changes(tmp_path: Path) -> None:

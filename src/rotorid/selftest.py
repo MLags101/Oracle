@@ -259,7 +259,7 @@ def _walk_the_wizard(result: Result, analysis: Any) -> None:
         Step(
             name="draw every stage",
             ok=True,
-            detail=f"{len(STAGES)} stages, up to and including Review & Export",
+            detail=f"{len(STAGES)} stages, {STAGES[0]} through {STAGES[-1]}",
             seconds=time.perf_counter() - started,
         )
     )

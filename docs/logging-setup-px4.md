@@ -15,6 +15,17 @@ evidence, not a limitation of the tool.
 
 Back up your parameters before changing any of this.
 
+## 0. Let RotorID write the file
+
+```bash
+rotorid profile --stack px4 -o collect.param
+```
+
+Logging only, safe to leave loaded. Add `--which sweep` to configure the autotune
+as well, with `MC_AT_APPLY = 0` so it identifies and reports without writing gains
+to the vehicle — which is what you want when the analysis is being done offline.
+The rest of this page is what those files contain and why.
+
 ## 1. Get excitation into the log
 
 Two options, best first.
@@ -24,7 +35,18 @@ station. It injects a deliberate excitation on each axis in turn and identifies
 its own model, so it produces exactly the kind of single-axis, wide-band data
 this tool wants. Fly it in stable air, at altitude, with room to recover.
 
-**Deliberate stick sweeps.** One axis per flight. Hold the other two as still as
+RotorID reads autotune's own conclusion out of the log as well as the flight data,
+and compares the two. Where they agree you have two independent estimates of one
+aircraft, which is evidence neither can produce alone; where they disagree
+(`VENDOR_TUNE_DISAGREES`) one of them describes a vehicle that does not exist, and
+that is worth knowing before you fly either. Set `MC_AT_APPLY = 0` so autotune
+reports without writing its gains to the vehicle.
+
+**Deliberate stick sweeps.** These are a *general* flight as far as RotorID is
+concerned — nothing in the log records that anybody asked for them — so load them
+with `--kind general` and expect `medium` confidence at best. That is the truth
+about the evidence rather than a limitation: what makes an autotune run worth more
+is that the vehicle wrote down that it was exciting itself. One axis per flight. Hold the other two as still as
 you can and sweep the stick from very slow (about one cycle every few seconds) to
 as fast as you can move it, over 60–120 seconds, without saturating the motors.
 Slow to fast, smoothly, not a series of flicks: RotorID needs low-frequency

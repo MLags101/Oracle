@@ -64,17 +64,19 @@ rotorid
 ```
 
 That is the whole invocation. The window opens with nothing loaded and the first
-screen asks for a log — a file picker, or drag one anywhere onto the window. You can
+screen asks for two things: which log, and **what kind of flight it was**. You can
 still name the file up front if you prefer:
 
 ```bash
 rotorid gui flight.bin
 ```
 
-Eight stages, in the order the analysis actually depends on: **Load**, **Health &
+Nine stages, in the order the analysis actually depends on: **Load**, **Health &
 Noise**, **Segment**, **Identify**, **Filters**, **Design**, **Review & Export**,
-**Next Flight**. Health comes before Identify because a model fitted to a shaking
-frame is not a weak model, it is confident nonsense.
+**Next Flight**, **Validate**. Health comes before Identify because a model fitted
+to a shaking frame is not a weak model, it is confident nonsense. Validate comes
+last because it is what you do when you come back with the flight the previous
+stage told you to fly.
 
 The Filters and Design stages are a live sandbox. Move a control and the margins, the
 predicted step, the predicted spectrum and the phase budget all move together, so the
@@ -82,6 +84,62 @@ trade-off is something you watch rather than something you are told about. Every
 recommended number carries a **why?** that opens its trace: the model it came from,
 the band that model is valid over, the constraint that stopped it going further, and
 what was rejected on the way.
+
+### Two kinds of flight
+
+A tuning flight and an ordinary one are different evidence, and RotorID asks which
+one you have rather than guessing. Guessing is what it used to do — look for a
+sweep, and quietly fall back to stick input when it found none — and the fallback
+was invisible in every number downstream.
+
+| | **Tuning flight** | **General flight** |
+|---|---|---|
+| What it is | a SYSTEMID sweep, or an autotune run | an ordinary flight |
+| Identified from | deliberate excitation only | ordinary stick activity only |
+| Confidence ceiling | `high` | `medium`, however well it fits |
+| Design | as bold as you ask for | held to at least 0.6 conservatism |
+| Operating-point sensitivity | not available | **yes** |
+
+Neither is a degraded version of the other. A two-minute sweep excites a known band
+on one axis at a time with a signal the controller did not choose, which is what
+makes a wide-band fit trustworthy — but it is flown at one throttle on one battery
+state, so it has nothing to say about how the airframe gain moves across the
+envelope. An ordinary flight visits the envelope, and that is a measurement a sweep
+cannot make.
+
+The declaration is honoured, not overridden. A log declared as a tuning flight is
+never quietly identified from stick input; a log declared general never uses a sweep
+that happens to be in it. If the file disagrees with what you said, RotorID says so
+(`LOG_KIND_MISMATCH`) rather than resolving it silently. Detection is the default and
+is right whenever the excitation was actually recorded — and only recorded excitation
+counts, because `SID_AXIS` says what *would* be injected, not that anything was.
+
+### Did it work?
+
+The Validate stage, and `rotorid validate`, take a second log — a flight flown after
+applying a recommendation — and put what the tool predicted next to what the aircraft
+did:
+
+```bash
+rotorid validate before.bin after.bin --session before.rotorid -o comparison.html
+```
+
+Three claims live in that comparison and it keeps them apart. *The aircraft changed*
+and *the aircraft improved* need only the two logs. *The tool was right* needs the
+saved session from the first analysis, because nothing else records what was
+predicted — without one, the report says at the top that it is an outcome comparison
+rather than a validation, instead of leaving a column quietly empty.
+
+It checks two predictions. The closed-loop step, against the step deconvolved from
+the new flight. And the predicted post-filter spectrum against the measured one —
+the half of a recommendation that normally goes unchecked, because a gain change
+announces itself in how the aircraft feels and a notch two hertz off the motor line
+does not.
+
+A prediction is only ever tested against a flight that flew it. The staged export
+deliberately loads filters one flight and gains the next, so an after-log flying the
+old gains is the *expected* outcome of following the plan; that reads as
+`TUNE_NOT_APPLIED`, not as a failed prediction.
 
 ### The command line
 
@@ -112,6 +170,31 @@ rotorid analyze flight.bin --axes roll,pitch,yaw -o report.html --export ./param
 rotorid session flight.rotorid
 ```
 
+**Set the vehicle up before you fly it** — the parameters that decide whether the
+log is usable at all, as a file rather than as a checklist:
+
+```bash
+rotorid profile --stack ardupilot -o collect.param
+```
+
+**Filters only, without identifying the airframe** — works on a log with no usable
+excitation in it, because the noise does not need a model:
+
+```bash
+rotorid filters flight.bin
+```
+
+**Re-render or re-export from a saved session**, without the log and without
+re-analysing:
+
+```bash
+rotorid report flight.rotorid -o report.html
+```
+
+```bash
+rotorid recommend flight.rotorid -o ./params --acknowledge VIBRATION_HIGH
+```
+
 **Check that this build works, and if not, which layer:**
 
 ```bash
@@ -123,6 +206,7 @@ Useful flags on `analyze`:
 | Flag | What it does |
 |---|---|
 | `--axes roll,pitch` | Which axes to analyse. Default is all three. |
+| `--kind general\|tuning` | What the flight was. Default is to detect it from the log. |
 | `--conservatism 0.7` | 0 is aggressive, 1 is docile. Default 0.5. |
 | `--export DIR` | Staged `.param` files, one per test flight, in the order to fly them. |
 | `--session FILE` | The whole analysis in one `.rotorid` bundle, reopenable later. |
@@ -160,8 +244,9 @@ The two that decide whether a log is usable at all:
   your frame, and says so rather than assuming the frame was fine.
 
 A deliberate SYSTEMID sweep is much better evidence than ordinary flight and is what
-`high` confidence requires — but ordinary flight is what most people have, and making
-it answer as much as it honestly can is the current line of work.
+`high` confidence requires — but ordinary flight is what most people have, and it is
+supported on its own terms rather than as a degraded sweep. See **Two kinds of
+flight** above for what each one buys and what it costs.
 
 ## Why it exists
 
@@ -184,7 +269,8 @@ have are the right ones, and shows the spectrum that says so.
 - **Guess.** Poor coherence, a missing message, a filter model that disagrees with the
   log, a frame shaking hard enough to move its own sensors — each surfaces as a
   blocking or warning finding. Silent degradation to a confident-looking bad tune is
-  the failure mode the tool exists to prevent.
+  the failure mode the tool exists to prevent, and it is why a log declared as a
+  tuning flight is refused rather than quietly identified from stick input.
 - **Hide its reasoning.** Every recommended number records the model it came from, the
   band it was identified over, the constraint that bounded it, and what the
   alternatives cost.
@@ -240,10 +326,11 @@ Early development. The full specification and milestone plan is in
 | M5 — guidance engine and staged flight plan | done |
 | M6/M7 — GUI shell, all eight stages, live sandbox | done |
 | M8 — staged `.param` export, session save/load, safety gates | done |
-| M9 — PX4 `.ulg` reader, filter chain and design | done against synthetic uLog bytes |
-| M10 — validation mode | in progress |
+| M9 — PX4 `.ulg` reader, filter chain and design, autotune ingest | done against synthetic uLog bytes |
+| M10 — validation mode | done; before/after screen, `rotorid validate`, HTML comparison |
 | M11 — single-file executables | done; `build.py`, verified by the binary's own self-check |
-| General flight logs — unbiased estimator, vibration, step response | in progress |
+| General flight logs — declared kind, unbiased estimator, vibration, step response | done |
+| Operating-point sensitivity (spec 5.9) | done against a synthetic mis-set thrust curve |
 
 The pipeline runs end to end: log → segment → frequency response with the loop
 divided out → filter chain deconvolved → airframe fit → noise spectrum → filters and
@@ -281,6 +368,7 @@ which holds every contract and all the numerics.
 
 ```
 src/rotorid/core/     analysis library, no Qt imports anywhere
+src/rotorid/core/logkind.py   what each kind of flight unlocks, and what it caps
 src/rotorid/gui/      PySide6 presentation layer over the core
 rotorid.toml          every threshold, with its source
 docs/                 how to set your vehicle up to produce a usable log

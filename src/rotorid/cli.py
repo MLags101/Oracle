@@ -397,7 +397,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         for axis, rec in results.items():
             _print_axis(axis, rec)
         for axis, why in result.failures.items():
-            print(f"\n{axis}: not analysed -- {why}")
+            print(f"\n{axis}: not analysed -- {_unprefixed(why, axis)}")
         _print_findings(findings)
         if args.report is not None and results:
             print(f"\nreport written to {args.report}")
@@ -459,7 +459,8 @@ def _cmd_filters(args: argparse.Namespace) -> int:
     because the *gain* half is impossible would be refusing the half that was
     possible.
     """
-    from rotorid.core.design.recommend import identify_axis
+    from rotorid.core.analysis.noise import noise_profile
+    from rotorid.core.preprocess.params import chain_from_bundle
 
     bundle = _read(args.log, _declared_kind(args))
     config = load_config(args.config)
@@ -467,13 +468,25 @@ def _cmd_filters(args: argparse.Namespace) -> int:
     failures: dict[str, str] = {}
 
     for axis in _axes_from(args):
-        try:
-            analysis = identify_axis(bundle, axis, config)
-        except ValueError as exc:
-            failures[axis] = str(exc)
+        signal = bundle.signals.get(f"rate.{axis}.measured")
+        if signal is None or signal.t.size < 2:
+            failures[axis] = "no gyro measurement in this log"
             continue
-        if analysis.noise is None:
-            failures[axis] = "no usable noise measurement in this log"
+        chain = chain_from_bundle(bundle, axis)
+        try:
+            noise = noise_profile(
+                bundle,
+                axis,
+                t_start=float(signal.t[0]),
+                t_end=float(signal.t[-1]),
+                chain=chain,
+                prominence_db=config.float_("noise", "peak_prominence_db"),
+                track_margin_db=config.float_("noise", "rpm_track_margin_db"),
+                deconv_floor_db=config.float_("filters", "deconv_floor_db"),
+                evidence_ceiling_hz=signal.native_nyquist_hz,
+            )
+        except (ValueError, KeyError) as exc:
+            failures[axis] = str(exc)
             continue
         payload["axes"][axis] = {
             "peaks": [
@@ -481,11 +494,13 @@ def _cmd_filters(args: argparse.Namespace) -> int:
                     "f_hz": round(p.f_hz, 1),
                     "kind": p.kind,
                     "magnitude_db": round(p.magnitude_db, 1),
+                    "tracks_rpm": p.tracks_rpm,
                 }
-                for p in analysis.noise.peaks
+                for p in noise.peaks
             ],
-            "flown_chain": _jsonable(analysis.chain),
-            "pre_filter_source": analysis.noise.pre_filter_source,
+            "flown_chain": _jsonable(chain),
+            "pre_filter_source": noise.pre_filter_source,
+            "noise_floor_db": round(noise.noise_floor_db, 1),
         }
     payload["failures"] = failures
 
@@ -501,8 +516,19 @@ def _cmd_filters(args: argparse.Namespace) -> int:
         if not found["peaks"]:
             print("    no peaks stand above the floor")
     for name, why in failures.items():
-        print(f"\n{name}: {why}")
+        print(f"\n{name}: {_unprefixed(why, name)}")
     return EXIT_OK if payload["axes"] else EXIT_BLOCKED
+
+
+def _unprefixed(message: str, axis: str) -> str:
+    """A message with its own leading ``"roll: "`` removed.
+
+    Most of these are written to be read on their own -- in a finding, in a
+    traceback, in a GUI dialog -- so they name their axis. Printing them under a
+    heading that names it too produces "roll: roll: ...".
+    """
+    prefix = f"{axis}: "
+    return message[len(prefix) :] if message.startswith(prefix) else message
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:

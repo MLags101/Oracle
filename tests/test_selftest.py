@@ -48,15 +48,18 @@ def test_every_layer_is_exercised(log: Path) -> None:
     assert names.index("read a log") < names.index("run the analysis")
 
 
-def test_it_reaches_the_review_stage(log: Path) -> None:
+def test_it_reaches_the_last_stage(log: Path) -> None:
     """Refreshed, not merely constructed.
 
     A plot widget that cannot find its backend builds perfectly happily and fails
     when asked to draw, which is exactly the failure a packaged build produces.
     """
+    from rotorid.gui.state import STAGES
+
     step = next(s for s in run_selftest(log).steps if s.name == "draw every stage")
     assert step.ok
-    assert "Review" in step.detail
+    assert STAGES[-1] in step.detail
+    assert str(len(STAGES)) in step.detail
 
 
 def test_a_log_the_analysis_refuses_is_still_a_working_build(

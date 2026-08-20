@@ -7,6 +7,28 @@ worth more than anything else you can do for the quality of the result.
 
 Back up your parameters before changing any of this.
 
+## 0. Let RotorID write the file
+
+Everything on this page is available as a parameter file you load, which is worth
+preferring: a recipe that has to be typed in correctly is a recipe half of us get
+wrong in the one place that decides everything downstream.
+
+```bash
+rotorid profile --stack ardupilot -o collect.param
+```
+
+That is the logging setup alone, and it is safe to leave loaded. To configure the
+sweep as well:
+
+```bash
+rotorid profile --stack ardupilot --which sweep --axis roll -o sweep-roll.param
+```
+
+That one is **not** safe to leave loaded — switching to SYSTEMID mode afterwards
+injects a chirp into the rate loop. Read the header, which says so, and set
+`SID_AXIS` back to 0 when the campaign is over. The rest of this page is what those
+files contain and why.
+
 ## 1. Set up the sweep
 
 One axis per flight. Set `SID_AXIS` for the axis you are doing:
@@ -101,9 +123,23 @@ done. It consumes log bandwidth and RAM continuously.
 rotorid inspect flight.bin
 ```
 
-That lists the signals found, the excitation segments detected, and anything
-missing. If it reports no excitation, the sweep did not make it into the log and
-nothing downstream is worth running.
+That lists the signals found, the excitation segments detected, what kind of
+flight RotorID reads this as, and anything missing. If it reports no excitation,
+the sweep did not make it into the log.
+
+That is not necessarily the end of it. A log with no sweep in it is still a
+**general flight log**, and RotorID will analyse it as one — narrower band, medium
+confidence at best, a more conservative design, and in exchange a measurement a
+sweep cannot make: how far the airframe gain moves across the throttle and battery
+range you actually fly in. Load it that way deliberately rather than hoping:
+
+```bash
+rotorid analyze flight.bin --kind general
+```
+
+What it will not do is quietly identify a flight you called a tuning flight from
+stick input instead. That fallback used to exist and it was invisible in every
+number downstream, which is exactly the failure this tool exists to prevent.
 
 `rotorid analyze` reports the rate each message was actually logged at whenever
 it is too slow to design against, as `LOG_RATE_TOO_LOW`. That one is a blocker:
@@ -114,9 +150,23 @@ it is not a weaker answer, it is a different aircraft.
 | If this is missing | What you lose |
 |---|---|
 | `LOG_BITMASK` bit 0 (ATTITUDE_FAST) | Everything. `RATE` logs at 10 Hz and the log carries nothing above 5 Hz. |
-| SYSTEMID sweep | Everything. Ordinary flight gives a low-confidence estimate at best. |
+| SYSTEMID sweep | The wide band, and the `high` confidence rating. Ordinary flight is still analysed, as a general flight log, capped at `medium`. |
 | `PID*` messages | Term-level diagnosis: slew limiting, D-term noise, integrator windup. |
 | Pre-filter gyro (`ISBH`/`ISBD`) | Verification that the modeled filter chain matches your aircraft's. |
 | ESC telemetry (`ESC.RPM`) | Per-motor notch tracking, and honest classification of which peaks track RPM. |
 | `PM` (CPU load) | The check on whether expensive notch options fit in your board's headroom. |
 | `VIBE` (`LOG_BITMASK` bit 2) | Any way to tell whether the gyro measured the aircraft or the frame. |
+| `BAT` and `RCOU` | Operating-point sensitivity: whether the airframe gain moves with throttle or with pack voltage. |
+
+## 5. Then fly it again
+
+The export numbers its files in flight order for a reason: filters first, gains
+second, one change per flight. When you come back with the second log, RotorID will
+put what it predicted next to what the aircraft did:
+
+```bash
+rotorid validate flight.bin after.bin --session flight.rotorid -o comparison.html
+```
+
+That is the only check in the tool that puts the model against the vehicle rather
+than against itself, and it is worth more than any amount of internal consistency.
