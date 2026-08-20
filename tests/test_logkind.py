@@ -221,3 +221,59 @@ def test_a_gate_is_built_rather_than_interpolated() -> None:
     assert gate.y[grid < 2.0].max() == 0.0
     assert gate.y[(grid >= 2.0) & (grid <= 4.0)].min() == 1.0
     assert gate.y[grid > 4.0].max() == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# The rating has to discriminate *within* a kind, not only between kinds
+# --------------------------------------------------------------------------- #
+
+
+def test_a_well_flown_general_log_reaches_the_top_of_its_range() -> None:
+    """Otherwise the rating carries no information about the log it describes.
+
+    A hand-flown slow-to-fast sweep and one stick waggle are not the same
+    evidence, and a rule that rated both `low` because neither was a SYSTEMID
+    chirp would be reporting the kind twice and the flight not at all -- the
+    ceiling already says the kind.
+    """
+    from tests.synthetic.generators import make_general_flight_bundle
+
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    rec = recommend_from(identify_axis(bundle, "roll", CONFIG), bundle, CONFIG)
+    assert rec.confidence == "medium"
+
+
+def test_a_narrow_band_general_log_is_still_low() -> None:
+    """Band width is the thing that decides, and it decides in both directions."""
+    from tests.synthetic.generators import make_general_flight_bundle
+
+    bundle = make_general_flight_bundle(
+        make_airframe(), make_chain(), f_start_hz=4.5, f_stop_hz=5.5
+    )
+    rec = recommend_from(identify_axis(bundle, "roll", CONFIG), bundle, CONFIG)
+    assert rec.confidence == "low"
+
+
+def test_the_recommendation_records_which_kind_of_flight_produced_it() -> None:
+    """A reloaded session has to be able to say why a good fit is only medium."""
+    from tests.synthetic.generators import make_general_flight_bundle
+
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    assert recommend_from(identify_axis(bundle, "roll", CONFIG), bundle, CONFIG).log_kind == (
+        "general"
+    )
+
+    sweep = _tuning()
+    assert recommend_from(identify_axis(sweep, "roll", CONFIG), sweep, CONFIG).log_kind == "tuning"
+
+
+def test_the_why_trace_explains_a_capped_rating() -> None:
+    """A trace that argues for `high` next to a `medium` is the worst outcome."""
+    from rotorid.core.guidance.explain import explain
+    from tests.synthetic.generators import make_general_flight_bundle
+
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    rec = recommend_from(identify_axis(bundle, "roll", CONFIG), bundle, CONFIG)
+    trace = explain("confidence", rec)
+    assert trace is not None
+    assert any("caps confidence at medium" in line for line in trace.because)

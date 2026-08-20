@@ -650,6 +650,12 @@ class TuneRecommendation:
     confidence: Confidence
     conservatism: float
     binding_constraint: str
+    #: The kind of flight this came from. Carried on the recommendation rather
+    #: than left on the log, because it bounds what :attr:`confidence` was allowed
+    #: to reach and what :attr:`conservatism` was allowed to fall to -- and a
+    #: reloaded session, or an exported report, has to be able to say why a
+    #: beautifully-fitting model is only rated medium.
+    log_kind: LogKind | None = None
 
 
 # --------------------------------------------------------------------------- #

@@ -133,6 +133,17 @@ class DesignStage(StageWidget):
         row.addWidget(self._slider_value)
         layout.addLayout(row)
 
+        # The floor a general flight log imposes is enforced in the designer
+        # whatever this slider says, so the slider has to stop where the designer
+        # does. A control that moves and changes nothing is worse than one that
+        # will not move: the user reads the number under their thumb and believes
+        # it.
+        self._floor = QLabel("")
+        self._floor.setObjectName("Muted")
+        self._floor.setWordWrap(True)
+        self._floor.setVisible(False)
+        layout.addWidget(self._floor)
+
         buttons = QHBoxLayout()
         reset = QPushButton("Reset to recommendation")
         reset.clicked.connect(self._reset)
@@ -224,11 +235,29 @@ class DesignStage(StageWidget):
         if self._axis not in axes:
             self._axis = axes[0]
         self._rebuild_axis_row(axes)
+        self._apply_floor()
         self._slider.blockSignals(True)
-        self._slider.setValue(round(100 * self.state.conservatism))
+        self._slider.setValue(round(100 * max(self.state.conservatism, self._floor_value())))
         self._slider.blockSignals(False)
         self._live = result.session.recommendations[self._axis]
         self._draw()
+
+    def _floor_value(self) -> float:
+        """Least conservatism this log's kind allows."""
+        return self.state.capabilities.conservatism_floor
+
+    def _apply_floor(self) -> None:
+        """Stop the slider where the designer stops, and say why it stopped there."""
+        floor = self._floor_value()
+        self._slider.setMinimum(round(100 * floor))
+        self._floor.setVisible(floor > 0.0)
+        if floor > 0.0:
+            self._floor.setText(
+                f"This is a general flight log, so the design is held to at least "
+                f"{floor:.2f}. A narrower identification band says less about where the "
+                f"loop actually crosses over, and the margin that covers the difference "
+                f"has to come from somewhere. Load a tuning flight to go below this."
+            )
 
     def _rebuild_axis_row(self, axes: tuple[Axis, ...]) -> None:
         while self._axis_row.count():

@@ -667,8 +667,33 @@ def _confidence(rec: TuneRecommendation) -> Explanation:
             "A model can fit a narrow, weakly excited band beautifully and still "
             "describe the aircraft badly, so band width and coherence count for more "
             "here than residual does.",
+            *_kind_ceiling_line(rec),
+            *_spread_line(rec),
         ),
         glossary=("coherence", "effective_plant"),
+    )
+
+
+def _kind_ceiling_line(rec: TuneRecommendation) -> tuple[str, ...]:
+    """Why a well-fitted model can still be rated medium.
+
+    Without this the trace reads as an argument for a high rating next to a
+    medium one, which is the most confusing thing an explanation can do. The
+    ceiling is a fact about the flight, not about the fit, and it has to be said
+    in the same breath.
+    """
+    from rotorid.core.logkind import capabilities
+
+    if rec.log_kind is None:
+        return ()
+    caps = capabilities(rec.log_kind)
+    if caps.max_confidence == "high":
+        return ()
+    return (
+        f"This is a {caps.label.lower()} log, which caps confidence at "
+        f"{caps.max_confidence} however well the model fits: the residual above is "
+        f"measuring agreement over a band the pilot chose, not over the band the loop "
+        f"is designed across.",
     )
 
 

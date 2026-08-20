@@ -148,3 +148,40 @@ def test_picking_an_unanalysed_axis_falls_back_rather_than_blanking(stage) -> No
     stage._pick_axis("yaw")
     assert stage._live is not None
     assert stage._axis in stage.state.result.session.recommendations
+
+
+def test_the_slider_stops_where_the_designer_stops(
+    qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A control that moves and changes nothing is worse than one that will not move.
+
+    A general flight log is designed at no less than its conservatism floor
+    whatever the slider says. If the slider still travelled below it, the user
+    would read the number under their thumb and believe it.
+    """
+    from rotorid.core.io import ardupilot
+    from rotorid.core.logkind import capabilities
+    from rotorid.gui.main_window import MainWindow
+    from rotorid.gui.state import AppState
+    from tests.synthetic.generators import make_general_flight_bundle
+
+    path = tmp_path / "general.bin"
+    path.write_bytes(b"")
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    monkeypatch.setattr(ardupilot, "read_ardupilot", lambda p, **kw: bundle)
+
+    win = MainWindow(AppState())
+    qtbot.addWidget(win)
+    with qtbot.waitSignal(win.state.log_loaded, timeout=60_000):
+        win.state.load_log(path)
+    with qtbot.waitSignal(win.state.analysis_finished, timeout=180_000):
+        win.state.run_analysis(("roll",))
+
+    stage = win.design_stage
+    stage.refresh()
+    floor = capabilities("general").conservatism_floor
+    assert stage._slider.minimum() == round(100 * floor)
+    assert not stage._floor.isHidden()
+
+    stage._slider.setValue(0)
+    assert stage._slider.value() == round(100 * floor), "the slider must not travel below it"

@@ -640,6 +640,7 @@ def recommend_from(
         dterm_noise_rms_pct=joint.dterm_noise_rms * 100.0,
         rationale=_rationale(analysis, joint),
         confidence=_confidence(analysis, config, bundle.kind),
+        log_kind=bundle.kind,
         conservatism=conservatism,
         binding_constraint=result.binding_constraint,
     )
@@ -805,7 +806,14 @@ def _confidence(analysis: AxisAnalysis, config: Config, kind: LogKind) -> Confid
     ):
         return "low"
 
-    if poor_fit or excitation < 0.5 or octaves < config.float_("coherence", "min_valid_octaves"):
+    # Note what is *not* here: a test on the excitation being weaker than a
+    # sweep. That used to demote every stick-input segment to low, and once a
+    # general flight became a kind of log rather than a failed sweep it stopped
+    # discriminating -- a hand-flown slow-to-fast sweep and one stick waggle both
+    # came out low, so the rating carried no information within the kind it was
+    # supposed to describe. What that test was really expressing is the ceiling,
+    # which is applied below. Within the kind, the band and the coherence decide.
+    if poor_fit or octaves < config.float_("coherence", "min_valid_octaves"):
         rating: Confidence = "low"
     elif excitation < 1.0 or model.coherence_mean < 0.8:
         rating = "medium"
