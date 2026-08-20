@@ -35,6 +35,7 @@ from rotorid.config import Config
 from rotorid.core.analysis.sysid import check_filter_model
 from rotorid.core.analysis.vibration import VibrationSummary, vibration_summary
 from rotorid.core.design.recommend import AxisAnalysis
+from rotorid.core.logkind import capabilities, detect_kind, kind_evidence
 from rotorid.core.types import AXES, Axis, Finding, LogBundle, TuneRecommendation
 
 __all__ = ["CHECKS", "GuidanceContext", "collect_findings"]
@@ -117,9 +118,103 @@ def collect_findings(context: GuidanceContext) -> tuple[Finding, ...]:
 # --------------------------------------------------------------------------- #
 
 
-def check_excitation(context: GuidanceContext) -> list[Finding]:
-    """Whether anything in the log was worth identifying from."""
+def check_log_kind(context: GuidanceContext) -> list[Finding]:
+    """What this log was flown as, what that unlocks, and whether it looks like it.
+
+    Runs first among the log-level checks because everything after it is read
+    differently depending on the answer. A user who does not know their log is
+    being analysed as ordinary flight has no way to interpret a medium-confidence
+    rating that could not have been anything else.
+    """
+    bundle = context.bundle
+    kind = bundle.kind
+    caps = capabilities(kind)
+    detected = detect_kind(bundle)
+    evidence = kind_evidence(bundle)
     out: list[Finding] = []
+
+    if bundle.kind_was_declared and detected != kind and kind == "tuning":
+        out.append(
+            Finding(
+                severity="warning",
+                code="LOG_KIND_MISMATCH",
+                title="declared a tuning flight, but no deliberate excitation is in it",
+                detail=(
+                    "This log was loaded as a tuning flight, so identification looks only "
+                    "for an injected sweep or an autotune run. Neither is present, which "
+                    "is why the axes below were refused rather than identified from stick "
+                    "input."
+                ),
+                action=(
+                    "Load it as a general flight log to identify it from what the pilot "
+                    f"flew, or fly a tuning flight (see {_doc(context)}) and analyse that."
+                ),
+                doc_link=_doc(context),
+            )
+        )
+    elif bundle.kind_was_declared and detected != kind and kind == "general":
+        out.append(
+            Finding(
+                severity="warning",
+                code="LOG_KIND_MISMATCH",
+                title="deliberate excitation in a log loaded as a general flight",
+                detail=(
+                    "This log carries "
+                    + "; ".join(evidence)
+                    + ". It was loaded as a general flight, so that excitation is not "
+                    "being used and the model comes from ordinary stick input instead -- "
+                    "much the weaker of the two."
+                ),
+                action="Load it again as a tuning flight log to identify from the sweep.",
+                doc_link=_doc(context),
+            )
+        )
+
+    if kind == "general":
+        out.append(
+            Finding(
+                severity="info",
+                code="GENERAL_FLIGHT_LOG",
+                title="analysed as a general flight",
+                detail=(caps.summary + " Because of that: " + " ".join(caps.limits)),
+                action=(
+                    "Nothing, if that is the flight you flew. For a wider identification "
+                    f"band and a tune designed with less held back, fly a sweep or an "
+                    f"autotune (see {_doc(context)}) and load it as a tuning flight."
+                ),
+                evidence={"conservatism_floor": caps.conservatism_floor},
+                doc_link=_doc(context),
+            )
+        )
+    else:
+        out.append(
+            Finding(
+                severity="good",
+                code="TUNING_FLIGHT_LOG",
+                title="analysed as a tuning flight",
+                detail=(
+                    "Identification used deliberate excitation: "
+                    + ("; ".join(evidence) if evidence else "a recorded sweep")
+                    + ". That is the evidence a wide-band model and a high confidence "
+                    "rating require."
+                ),
+                action="Nothing. This is the log the analysis is designed around.",
+            )
+        )
+    return out
+
+
+def check_excitation(context: GuidanceContext) -> list[Finding]:
+    """Whether the excitation that was found was as good as its class allows.
+
+    Silent on a general flight: that every segment is stick input is the
+    definition of the thing the user declared, and repeating it once per axis
+    would bury the findings that are actually about this aircraft.
+    ``GENERAL_FLIGHT_LOG`` states it once instead.
+    """
+    out: list[Finding] = []
+    if context.bundle.kind == "general":
+        return out
     for axis in context.axes():
         analysis = context.analyses[axis]
         best = max(s.confidence for s in analysis.segments)
@@ -131,10 +226,11 @@ def check_excitation(context: GuidanceContext) -> list[Finding]:
                 code="WEAK_EXCITATION",
                 title=f"{axis}: no deliberate frequency sweep",
                 detail=(
-                    f"The {axis} identification used {len(analysis.segments)} segment(s) of "
-                    f"ordinary flight rather than a SYSTEMID sweep. Pilot inputs excite a "
-                    f"narrow, uneven band, so the model is fitted where the data happens to "
-                    f"be rather than where the loop is designed."
+                    f"The {axis} identification used {len(analysis.segments)} "
+                    f"{analysis.segments[0].kind} segment(s) rather than a SYSTEMID sweep. "
+                    f"An autotune twitch is a step, not a sweep, so it excites a band "
+                    f"nobody chose and the model is fitted where the data happens to be "
+                    f"rather than where the loop is designed."
                 ),
                 action=(
                     (
@@ -1186,6 +1282,7 @@ def _ratio(new: float, old: float) -> float:
 #: findings are sorted by severity -- but keeping related checks adjacent makes
 #: the module readable.
 CHECKS: tuple[Check, ...] = (
+    check_log_kind,
     check_vibration,
     check_clipping,
     check_oscillation,

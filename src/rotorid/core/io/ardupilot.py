@@ -17,19 +17,25 @@ annotated -- the fallback table below is used and the substitution is recorded i
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from rotorid.core.io.base import LogReader, ProgressCallback, canonical_signal
+from rotorid.core.io.base import (
+    LogReader,
+    ProgressCallback,
+    canonical_signal,
+    gate_signal,
+)
 from rotorid.core.preprocess.resample import (
     grid_rate_hz,
     measure_jitter,
     resample_to_grid,
     uniform_grid,
 )
-from rotorid.core.types import AXES, Axis, FloatArray, LogBundle, Signal
+from rotorid.core.types import AXES, Axis, FloatArray, LogBundle, LogKind, Signal
 
 __all__ = ["SID_AXIS_MAP", "ArduPilotReader", "read_ardupilot"]
 
@@ -98,7 +104,16 @@ _MESSAGES_WANTED = (
     "VIBE",
     "PM",
     "MSG",
+    "EV",
 )
+
+#: ArduPilot ``LogEvent`` codes that bracket an autotune run. Numeric rather than
+#: read out of ``MSG`` text: the codes are enum constants that have not moved in
+#: years, while the human-readable strings differ between versions and between
+#: Copter and the other vehicles. Parsing the prose is how a tool comes to work
+#: on the author's firmware and nowhere else.
+_EV_AUTOTUNE_START = frozenset({30, 32})  # INITIALISED, RESTART
+_EV_AUTOTUNE_STOP = frozenset({31, 33, 34})  # OFF, SUCCESS, FAILED
 
 _AXIS_LETTER: dict[Axis, str] = {"roll": "R", "pitch": "P", "yaw": "Y"}
 _PID_AXIS: dict[str, Axis] = {"PIDR": "roll", "PIDP": "pitch", "PIDY": "yaw"}
@@ -310,6 +325,33 @@ class ArduPilotReader(LogReader):
             value = getattr(msg, "Load", None)
             if value is not None:
                 raw.setdefault("cpu.load", []).append((t, float(value) / 1000.0))
+        elif kind == "EV":
+            code = getattr(msg, "Id", None)
+            if code is not None:
+                raw.setdefault("_ev", []).append((t, float(code)))
+
+    def _autotune_windows(
+        self, raw: dict[str, list[tuple[float, float]]], t_end: float
+    ) -> list[tuple[float, float]]:
+        """Stretches of the flight during which autotune was running.
+
+        A start with no matching stop runs to the end of the log rather than
+        being discarded: an autotune that was still going when the battery died
+        is exactly the flight somebody wants analysed, and dropping the window
+        would silently turn it into an ordinary flight.
+        """
+        windows: list[tuple[float, float]] = []
+        start: float | None = None
+        for t, code in raw.get("_ev", []):
+            value = int(code)
+            if value in _EV_AUTOTUNE_START and start is None:
+                start = t
+            elif value in _EV_AUTOTUNE_STOP and start is not None:
+                windows.append((start, t))
+                start = None
+        if start is not None and t_end > start:
+            windows.append((start, t_end))
+        return windows
 
     def _params_from_sids(self, raw: dict[str, list[tuple[float, float]]]) -> dict[str, float]:
         """Recover the sweep configuration that ``SIDS`` recorded.
@@ -379,6 +421,12 @@ class ArduPilotReader(LogReader):
 
         if raw.get("_sidd.targ"):
             signals.update(self._excitation_signals(raw, params, grid))
+
+        autotune = self._autotune_windows(raw, float(grid[-1]))
+        if autotune:
+            signals["mode.autotune"] = gate_signal(
+                "mode.autotune", grid, autotune, source_msg="EV.Id"
+            )
 
         if progress is not None:
             progress(0.95, "resampled")
@@ -455,6 +503,18 @@ def _highest_modeled_notch_hz(params: dict[str, float]) -> float:
     return highest
 
 
-def read_ardupilot(path: Path, progress: ProgressCallback | None = None) -> LogBundle:
-    """Convenience wrapper: read one ``.bin`` in a single call."""
-    return ArduPilotReader(path).read(progress)
+def read_ardupilot(
+    path: Path,
+    progress: ProgressCallback | None = None,
+    *,
+    kind: LogKind | None = None,
+) -> LogBundle:
+    """Convenience wrapper: read one ``.bin`` in a single call.
+
+    Args:
+        kind: What the user says this flight was. Recorded on the bundle rather
+            than acted on here -- the reader's job is to say what is in the file,
+            and what the file is *for* is not something the file knows.
+    """
+    bundle = ArduPilotReader(path).read(progress)
+    return replace(bundle, declared_kind=kind) if kind is not None else bundle

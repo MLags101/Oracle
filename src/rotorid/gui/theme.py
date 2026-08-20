@@ -89,6 +89,7 @@ class Palette:
         QFrame#Card, QGroupBox {{ background: {self.surface}; border-radius: 6px; }}
         QLabel#Muted {{ color: {self.muted}; }}
         QLabel#Heading {{ font-size: 15px; font-weight: 600; }}
+        QLabel#Subheading {{ font-size: 13px; font-weight: 600; }}
         QPushButton {{
             background: {self.surface}; border: 1px solid {self.grid};
             border-radius: 4px; padding: 5px 12px;

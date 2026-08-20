@@ -274,6 +274,7 @@ def make_bundle(
     sweep_fraction: float = 0.12,
     gains: tuple[float, float, float] = (0.135, 0.135, 0.0036),
     stack: Stack = "ardupilot",
+    record_excitation: bool = True,
     path: str = "synthetic.bin",
 ) -> LogBundle:
     """A complete synthetic ``LogBundle``: a SYSTEMID sweep on one axis.
@@ -296,6 +297,10 @@ def make_bundle(
             be found by its energy rather than read off an injected-signal
             message, and the lower confidence that follows is the truth about
             that log rather than a limitation of the fixture.
+        record_excitation: Whether ``excite.*`` is written. ``False`` produces the
+            same flight as an ArduPilot log that carries no ``SIDD`` record --
+            which is what a general flight is, and the fixture the log-kind rules
+            are tested against. Ignored for PX4, which never has one.
     """
     from pathlib import Path
 
@@ -374,7 +379,7 @@ def make_bundle(
         )
         break
 
-    signals = _sweep_signals(axis, t_log, u_log, y_log, excite=True)
+    signals = _sweep_signals(axis, t_log, u_log, y_log, excite=record_excitation)
 
     if with_motor_noise:
         params["MOT_THST_HOVER"] = 0.35

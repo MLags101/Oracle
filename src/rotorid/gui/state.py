@@ -21,7 +21,8 @@ from PySide6.QtCore import QObject, QThreadPool, Signal
 
 from rotorid import __version__
 from rotorid.config import Config, load_config
-from rotorid.core.types import AXES, Axis, Finding, LogBundle
+from rotorid.core.logkind import Capabilities, capabilities
+from rotorid.core.types import AXES, Axis, Finding, LogBundle, LogKind
 from rotorid.gui.workers import Job
 
 __all__ = ["STAGES", "AppState", "Stage"]
@@ -56,12 +57,19 @@ class AppState(QObject):
 
     acknowledgements_changed = Signal()
     busy_changed = Signal(bool)
+    kind_changed = Signal(object)  # LogKind | None
 
     def __init__(self, config: Config | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.config = config if config is not None else load_config()
         self.bundle: LogBundle | None = None
         self.result: Any = None  # AnalysisResult, imported lazily to keep Qt out of core
+        #: What the user says the next log they open is. ``None`` means "let the
+        #: file say", which is the default because it is right whenever the
+        #: excitation is actually recorded. Held on the session rather than passed
+        #: at each call so the File menu, the drop target and the Load button
+        #: cannot disagree about it.
+        self.declared_kind: LogKind | None = None
         self.conservatism = 0.5
         self.acknowledgements: dict[str, str] = {}
 
@@ -76,6 +84,29 @@ class AppState(QObject):
     # Loading
     # ----------------------------------------------------------------- #
 
+    def declare_kind(self, kind: LogKind | None) -> None:
+        """Say what kind of flight the next log is, or ``None`` to let it be detected.
+
+        Re-reads an already-open log rather than reinterpreting it in place. The
+        declaration changes which segments are searched for, so a bundle carrying
+        the new label and the old signals would be a lie the whole analysis then
+        builds on -- and re-reading is the only operation that cannot get that
+        wrong.
+        """
+        if kind == self.declared_kind:
+            return
+        self.declared_kind = kind
+        self.kind_changed.emit(kind)
+        if self.bundle is not None:
+            self.load_log(self.bundle.path)
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """What the kind currently in force supports. Falls back to the declaration."""
+        if self.bundle is not None:
+            return capabilities(self.bundle.kind)
+        return capabilities(self.declared_kind or "general")
+
     def load_log(self, path: Path) -> None:
         """Read a log, off the GUI thread.
 
@@ -86,10 +117,11 @@ class AppState(QObject):
         from rotorid.core.io.px4 import read_px4
 
         reader = read_px4 if path.suffix.lower() == ".ulg" else read_ardupilot
+        kind = self.declared_kind
         self._clear()
         self.log_loading.emit(str(path))
         self._start(
-            Job(reader, path, wants_progress=False),
+            Job(reader, path, kind=kind, wants_progress=False),
             on_finished=self._log_ready,
             on_failed=self.log_failed.emit,
         )

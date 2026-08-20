@@ -5,14 +5,32 @@ single-axis excitation with a known schedule, and everything downstream is much
 better conditioned because of it. Ordinary flight is supported as a fallback, but
 never silently: a segment carries the confidence it earned, and a weak one caps
 the confidence of the recommendation built on it.
+
+Which of the two is searched for is the log's declared kind
+(:mod:`rotorid.core.logkind`) rather than whichever happens to be found. Silently
+falling back from a sweep to stick inputs is how a user ends up reading a number
+that came from evidence they would have rejected: the label on the screen still
+says the flight they flew, and the model underneath came from somewhere else.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import replace
+
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
-from rotorid.core.types import AXES, Axis, BoolArray, ExcitationSegment, FloatArray, LogBundle
+from rotorid.core.types import (
+    AXES,
+    Axis,
+    BoolArray,
+    ExcitationSegment,
+    FloatArray,
+    LogBundle,
+    LogKind,
+    SegmentKind,
+)
 
 __all__ = ["propose_segments"]
 
@@ -50,18 +68,34 @@ _ENERGY_MIN_AMPLITUDE = 0.01
 _MIN_SEGMENT_S = 5.0
 
 
-def propose_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
+def propose_segments(
+    bundle: LogBundle, kind: LogKind | None = None
+) -> tuple[ExcitationSegment, ...]:
     """Auto-propose identification windows, best evidence first.
 
+    Args:
+        kind: Which class of excitation to look for. Defaults to the log's own
+            :attr:`~rotorid.core.types.LogBundle.kind`. A tuning flight is
+            identified from deliberate excitation only; a general flight from
+            ordinary stick activity only. Neither falls back to the other,
+            because the fallback is invisible in every downstream number.
+
     Returns:
-        Segments in descending confidence order. Empty if nothing in the log is
-        excited enough to identify from -- which is a finding for the caller to
+        Segments in descending confidence order. Empty if nothing of the
+        requested class is present -- which is a finding for the caller to
         report, not something to paper over with a shorter window.
     """
+    if (kind if kind is not None else bundle.kind) == "tuning":
+        return _deliberate_segments(bundle)
+    return _energy_segments(bundle)
+
+
+def _deliberate_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
+    """Excitation somebody asked for: an injected sweep, or an autotune run."""
     chirps = _systemid_segments(bundle)
     if chirps:
         return chirps
-    return _energy_segments(bundle)
+    return _autotune_segments(bundle)
 
 
 def _systemid_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
@@ -115,7 +149,37 @@ def _injection_point(bundle: LogBundle) -> str | None:
     return mapped[1] if mapped else None
 
 
-def _energy_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
+def _autotune_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
+    """Twitches from the firmware's own autotune, if it ran.
+
+    The window comes from the vehicle (``mode.autotune``); the axis comes from the
+    data. Both stacks say *that* autotune was running far more reliably than they
+    say which axis it was working on -- ArduPilot's per-axis progress is prose in
+    the message log, PX4's is an internal state enum that has been renumbered --
+    so the axis is decided by which one was actually being moved, which is a fact
+    about the flight rather than about the firmware version.
+
+    Worth less than a chirp and more than a stick input: an autotune twitch is a
+    deliberate, single-axis, repeatable excitation, but it is a step rather than a
+    sweep, so it excites a band nobody chose.
+    """
+    gate = bundle.signals.get("mode.autotune")
+    if gate is None or not gate.y.size:
+        return ()
+    windows = _runs(gate.y > 0.5, gate.t)
+    if not windows:
+        return ()
+    kind: SegmentKind = "px4_autotune" if bundle.stack == "px4" else "autotune_twitch"
+    out = [
+        replace(segment, kind=kind, confidence=_CONFIDENCE[kind])
+        for segment in _energy_segments(bundle, windows=windows)
+    ]
+    return tuple(out)
+
+
+def _energy_segments(
+    bundle: LogBundle, windows: Sequence[tuple[float, float]] | None = None
+) -> tuple[ExcitationSegment, ...]:
     """Fallback: stretches of ordinary flight with strong single-axis activity.
 
     Always low confidence. Pilot input is narrow-band, correlated across axes, and
@@ -132,15 +196,22 @@ def _energy_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
         envelopes[axis] = _envelope(bundle.signals[key].y, rate)
 
     t = bundle.signals[f"rate.{AXES[0]}.output"].t
+    # Confining the search also confines what "peak" means, which is the point:
+    # the threshold is a fraction of the largest excitation *in the window*, so a
+    # gentle autotune twitch is not measured against a violent stick input that
+    # happened somewhere else in the flight.
+    inside = _mask_for(t, windows)
     out: list[ExcitationSegment] = []
     for axis in AXES:
         others = np.maximum.reduce([envelopes[a] for a in AXES if a != axis])
-        peak = float(np.max(envelopes[axis]))
+        peak = float(np.max(envelopes[axis][inside])) if inside.any() else 0.0
         if peak < _ENERGY_MIN_AMPLITUDE:
             continue
         threshold = _EXCITED_FRACTION_OF_PEAK * peak
-        excited = (envelopes[axis] > threshold) & (
-            others < envelopes[axis] * _CROSS_AXIS_QUIET_RATIO
+        excited = (
+            inside
+            & (envelopes[axis] > threshold)
+            & (others < envelopes[axis] * _CROSS_AXIS_QUIET_RATIO)
         )
         for start, end in _runs(excited, t):
             if end - start < _MIN_SEGMENT_S:
@@ -157,6 +228,16 @@ def _energy_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
                 )
             )
     return tuple(sorted(out, key=lambda s: -s.duration_s))
+
+
+def _mask_for(t: FloatArray, windows: Sequence[tuple[float, float]] | None) -> BoolArray:
+    """Samples inside any of ``windows``; everything, when there are none."""
+    if windows is None:
+        return np.ones(t.shape, dtype=np.bool_)
+    mask = np.zeros(t.shape, dtype=np.bool_)
+    for start, end in windows:
+        mask |= (t >= start) & (t <= end)
+    return mask
 
 
 def _envelope(y: FloatArray, sample_rate_hz: float) -> FloatArray:

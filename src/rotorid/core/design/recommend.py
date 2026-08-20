@@ -51,6 +51,7 @@ from rotorid.core.design.joint import JointResult, optimize_jointly
 from rotorid.core.design.objectives import DesignResult, DesignTargets
 from rotorid.core.filters.chain import FilterChain, OperatingPoint
 from rotorid.core.filters.latency import actuator_latency_ms, build_budget
+from rotorid.core.logkind import capabilities
 from rotorid.core.preprocess.params import (
     chain_from_bundle,
     gains_from_bundle,
@@ -65,6 +66,7 @@ from rotorid.core.types import (
     ExcitationSegment,
     FrequencyResponse,
     LogBundle,
+    LogKind,
     NoiseProfile,
     StepMetrics,
     TuneRecommendation,
@@ -171,17 +173,7 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     """
     segments = tuple(s for s in propose_segments(bundle) if s.axis == axis)
     if not segments:
-        how = (
-            "Fly an ArduPilot SYSTEMID sweep on this axis (see docs/logging-setup-ardupilot.md)."
-            if bundle.stack == "ardupilot"
-            else (
-                "PX4 has no SYSTEMID mode, so the excitation has to come from "
-                "somewhere else: run the multicopter autotune on this axis, or fly "
-                "deliberate single-axis stick sweeps from slow to fast with the "
-                "other two axes held still."
-            )
-        )
-        raise ValueError(f"no usable excitation found on {axis}. {how}")
+        raise ValueError(_nothing_to_identify(bundle, axis))
 
     measured_key = f"rate.{axis}.measured"
     output_key = f"rate.{axis}.output"
@@ -333,6 +325,45 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     )
 
 
+def _nothing_to_identify(bundle: LogBundle, axis: Axis) -> str:
+    """Why this axis produced no segment, phrased against what the user declared.
+
+    The two kinds fail for opposite reasons and the fixes are opposite too, so a
+    single "no usable excitation" message would send half the users to change the
+    wrong thing. A tuning flight with nothing in it means the sweep did not
+    happen; a general flight with nothing in it means the pilot never moved that
+    axis on its own.
+    """
+    if bundle.kind == "tuning":
+        how = (
+            "Fly an ArduPilot SYSTEMID sweep on this axis (see docs/logging-setup-ardupilot.md), "
+            "or run the autotune."
+            if bundle.stack == "ardupilot"
+            else (
+                "PX4 has no SYSTEMID mode, so the excitation has to come from the "
+                "multicopter autotune (MC_AT_EN = 1, MC_AT_APPLY = 0)."
+            )
+        )
+        how_it_got_here = (
+            "was loaded as a tuning flight"
+            if bundle.kind_was_declared
+            else "carries deliberate excitation on another axis, so it is being read as a "
+            "tuning flight"
+        )
+        return (
+            f"{axis}: this log {how_it_got_here}, but nothing was deliberately excited on "
+            f"{axis} itself. {how} If it was an ordinary flight, load it as a general "
+            "flight log instead and it will be identified from the stick input it has."
+        )
+    return (
+        f"{axis}: no stretch of this flight excites {axis} on its own for long enough to "
+        "identify from. Ordinary flight only identifies an axis the pilot moved "
+        "deliberately, for at least five seconds, while holding the other two still. "
+        "Fly a tuning flight for a model that does not depend on what the pilot happened "
+        "to do."
+    )
+
+
 def _oscillation_for(
     bundle: LogBundle,
     axis: Axis,
@@ -419,11 +450,20 @@ def recommend_from(
     every slider movement and must not re-run the identification to do it.
 
     Args:
+        conservatism: 0 aggressive, 1 docile. Raised to the floor the log's kind
+            imposes (:mod:`rotorid.core.logkind`) if it is below it, so a slider
+            at zero on a general flight still designs a general flight's tune.
         chain_override: A filter chain chosen by hand. Skips filter design and
             designs the gains against exactly that chain, so what the sandbox
             shows is what the aircraft would do -- including when the hand-built
             chain is worse than the recommended one.
     """
+    # A general flight identifies a narrower band than a sweep does, so the
+    # designer is not allowed to be as bold with it however good the fit looks.
+    # Raised here rather than at the call site because the sandbox, the CLI and
+    # the report all call this and would each have to remember.
+    conservatism = max(conservatism, capabilities(bundle.kind).conservatism_floor)
+
     targets = DesignTargets(
         pm_min_deg=config.float_("margins", "pm_min_deg"),
         gm_min_db=config.float_("margins", "gm_min_db"),
@@ -501,7 +541,7 @@ def recommend_from(
         predicted_step=step_metrics(t, y),
         dterm_noise_rms_pct=joint.dterm_noise_rms * 100.0,
         rationale=_rationale(analysis, joint),
-        confidence=_confidence(analysis, config),
+        confidence=_confidence(analysis, config, bundle.kind),
         conservatism=conservatism,
         binding_constraint=result.binding_constraint,
     )
@@ -642,13 +682,15 @@ def _rationale(analysis: AxisAnalysis, joint: JointResult) -> str:
     )
 
 
-def _confidence(analysis: AxisAnalysis, config: Config) -> Confidence:
+def _confidence(analysis: AxisAnalysis, config: Config, kind: LogKind) -> Confidence:
     """How much the identification deserves to be trusted.
 
     Driven by the evidence rather than by the fit residual alone: a model can fit
     a narrow, weakly excited band beautifully and still describe the aircraft
-    badly.
+    badly. The log's declared kind sets a ceiling over the top of that, because
+    what the flight *was* bounds what any residual can prove about it.
     """
+    ceiling = capabilities(kind).max_confidence
     excitation = max(s.confidence for s in analysis.segments)
     band = analysis.deconvolved.valid_band_hz
     octaves = float(np.log2(band[1] / band[0])) if band[0] > 0.0 else 0.0
@@ -658,7 +700,20 @@ def _confidence(analysis: AxisAnalysis, config: Config) -> Confidence:
         model.fit_rms_deg > config.float_("fit", "max_rms_deg")
     )
     if poor_fit or excitation < 0.5 or octaves < config.float_("coherence", "min_valid_octaves"):
-        return "low"
-    if excitation < 1.0 or model.coherence_mean < 0.8:
-        return "medium"
-    return "high"
+        rating: Confidence = "low"
+    elif excitation < 1.0 or model.coherence_mean < 0.8:
+        rating = "medium"
+    else:
+        rating = "high"
+    return _capped(rating, ceiling)
+
+
+def _capped(rating: Confidence, ceiling: Confidence) -> Confidence:
+    """The lower of two ratings.
+
+    A ceiling, never a floor. What a log *is* can only take confidence away: a
+    general flight that fits beautifully is still a general flight, and a tuning
+    flight that fits badly does not become trustworthy because a sweep was flown.
+    """
+    order: tuple[Confidence, ...] = ("low", "medium", "high")
+    return order[min(order.index(rating), order.index(ceiling))]

@@ -21,7 +21,8 @@ from typing import Any, cast
 
 from rotorid import __version__
 from rotorid.config import load_config
-from rotorid.core.types import AXES, Axis, LogBundle
+from rotorid.core.logkind import KINDS
+from rotorid.core.types import AXES, Axis, LogBundle, LogKind
 
 __all__ = ["main"]
 
@@ -74,12 +75,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     inspect = sub.add_parser("inspect", help="what is in a log, and what is missing")
     inspect.add_argument("log", type=Path)
+    _add_kind_argument(inspect)
     inspect.add_argument("--json", action="store_true")
     inspect.set_defaults(handler=_cmd_inspect)
 
     analyze = sub.add_parser("analyze", help="identify and recommend gains")
     analyze.add_argument("log", type=Path)
     analyze.add_argument("--axes", default="roll,pitch,yaw", help="comma-separated axis list")
+    _add_kind_argument(analyze)
     analyze.add_argument("--conservatism", type=float, default=0.5, help="0 aggressive, 1 docile")
     analyze.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
     analyze.add_argument("-o", "--report", type=Path, default=None, help="write an HTML report")
@@ -135,7 +138,34 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read(path: Path) -> LogBundle:
+def _add_kind_argument(parser: argparse.ArgumentParser) -> None:
+    """The one question the tool cannot answer for the user (spec 5.2).
+
+    ``auto`` is the default rather than ``general`` because guessing wrong in
+    either direction is worse than reading the file: declaring a sweep flight as
+    ordinary throws away the sweep, and declaring an ordinary flight as a tuning
+    one refuses it outright. Detection is right whenever the excitation is
+    actually recorded, which is the only case where the distinction has teeth.
+    """
+    parser.add_argument(
+        "--kind",
+        choices=("auto", *KINDS),
+        default="auto",
+        help=(
+            "what this flight was. 'tuning' identifies from an injected sweep or an "
+            "autotune run only; 'general' identifies from ordinary stick input, caps "
+            "confidence at medium and holds the design back. Default: detect from the log"
+        ),
+    )
+
+
+def _declared_kind(args: argparse.Namespace) -> LogKind | None:
+    """The ``--kind`` flag as the readers want it: ``None`` for detect."""
+    kind = getattr(args, "kind", "auto")
+    return None if kind == "auto" else cast("LogKind", kind)
+
+
+def _read(path: Path, kind: LogKind | None = None) -> LogBundle:
     """Read a log, choosing the reader by extension.
 
     Extension, not content sniffing: a file named ``.bin`` that is really a uLog
@@ -149,22 +179,30 @@ def _read(path: Path) -> LogBundle:
         raise FileNotFoundError(f"{path} does not exist")
     suffix = path.suffix.lower()
     if suffix == ".bin":
-        return read_ardupilot(path)
+        return read_ardupilot(path, kind=kind)
     if suffix == ".ulg":
-        return read_px4(path)
+        return read_px4(path, kind=kind)
     raise ValueError(
         f"{path.name}: expected an ArduPilot .bin or a PX4 .ulg log, not {suffix or 'no'} extension"
     )
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:
-    bundle = _read(args.log)
+    bundle = _read(args.log, _declared_kind(args))
+    from rotorid.core.logkind import capabilities, detect_kind, kind_evidence
     from rotorid.core.preprocess.segment import propose_segments
 
     segments = propose_segments(bundle)
+    caps = capabilities(bundle.kind)
     payload = {
         "path": str(bundle.path),
         "stack": bundle.stack,
+        "kind": bundle.kind,
+        "kind_declared": bundle.kind_was_declared,
+        "kind_detected": detect_kind(bundle),
+        "kind_evidence": list(kind_evidence(bundle)),
+        "offers": list(caps.offers),
+        "limits": list(caps.limits),
         "firmware": bundle.firmware_version,
         "sample_rate_hz": bundle.sample_rate_hz,
         "loop_rate_hz": bundle.loop_rate_hz,
@@ -188,6 +226,10 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     print(f"{bundle.path.name}  [{bundle.stack}]  {bundle.firmware_version or 'firmware unknown'}")
+    source = "you said so" if bundle.kind_was_declared else "detected"
+    print(f"  read as a {caps.label.lower()} log ({source})")
+    for line in kind_evidence(bundle) or ("no deliberate excitation recorded",):
+        print(f"    - {line}")
     print(
         f"  grid {bundle.sample_rate_hz:.0f} Hz   loop {bundle.loop_rate_hz:.0f} Hz   "
         f"gyro {bundle.gyro_sample_rate_hz:.0f} Hz   {len(bundle.params)} params"
@@ -204,6 +246,8 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             )
     else:
         print(f"  excitation: none found -- see docs/logging-setup-{bundle.stack}.md")
+    for limit in caps.limits:
+        print(f"  . {limit}")
     for warning in bundle.warnings:
         print(f"  ! {warning}")
     return EXIT_OK
@@ -215,7 +259,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     from rotorid.core.export.session import save_session
     from rotorid.core.pipeline import analyze
 
-    bundle = _read(args.log)
+    bundle = _read(args.log, _declared_kind(args))
     config = load_config(args.config)
     axes = [a.strip() for a in args.axes.split(",") if a.strip()]
     unknown = [a for a in axes if a not in AXES]

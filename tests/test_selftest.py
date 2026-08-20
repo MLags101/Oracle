@@ -26,7 +26,7 @@ def log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     path = tmp_path / "flight.bin"
     path.write_bytes(b"")
     bundle = make_bundle(make_airframe(), make_chain())
-    monkeypatch.setattr(cli, "_read", lambda p: bundle)
+    monkeypatch.setattr(cli, "_read", lambda p, kind=None: bundle)
     return path
 
 
@@ -68,7 +68,7 @@ def test_a_log_the_analysis_refuses_is_still_a_working_build(
     path = tmp_path / "flight.bin"
     path.write_bytes(b"")
     bundle = make_bundle(make_airframe(), make_chain())
-    monkeypatch.setattr(cli, "_read", lambda p: bundle)
+    monkeypatch.setattr(cli, "_read", lambda p, kind=None: bundle)
 
     real = pipeline.analyze
 

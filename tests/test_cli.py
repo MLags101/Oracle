@@ -9,6 +9,7 @@ surface, not ``.bin`` parsing.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,11 @@ def synthetic_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     path = tmp_path / "flight.bin"
     path.write_bytes(b"")
     bundle = make_bundle(make_airframe(), make_chain())
-    monkeypatch.setattr(cli, "_read", lambda p: bundle)
+    monkeypatch.setattr(
+        cli,
+        "_read",
+        lambda p, kind=None: bundle if kind is None else replace(bundle, declared_kind=kind),
+    )
     return path
 
 
@@ -118,7 +123,7 @@ def test_no_analysable_axis_exits_blocked(monkeypatch: pytest.MonkeyPatch, tmp_p
     path = tmp_path / "quiet.bin"
     path.write_bytes(b"")
     bundle = make_bundle(make_airframe(), make_chain(), axis="roll")
-    monkeypatch.setattr(cli, "_read", lambda p: bundle)
+    monkeypatch.setattr(cli, "_read", lambda p, kind=None: bundle)
     assert cli.main(["analyze", str(path), "--axes", "yaw"]) == cli.EXIT_BLOCKED
 
 

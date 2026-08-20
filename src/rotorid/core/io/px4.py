@@ -23,19 +23,25 @@ is what lets the deconvolution stage divide the chain back out exactly once.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from rotorid.core.io.base import LogReader, ProgressCallback, canonical_signal
+from rotorid.core.io.base import (
+    LogReader,
+    ProgressCallback,
+    canonical_signal,
+    gate_signal,
+)
 from rotorid.core.preprocess.resample import (
     grid_rate_hz,
     measure_jitter,
     resample_to_grid,
     uniform_grid,
 )
-from rotorid.core.types import AXES, Axis, FloatArray, LogBundle, Signal
+from rotorid.core.types import AXES, Axis, FloatArray, LogBundle, LogKind, Signal
 
 __all__ = ["PX4Reader", "read_px4"]
 
@@ -68,14 +74,32 @@ _POST_FILTER = ("vehicle_angular_velocity", "vehicle_angular_acceleration")
 #: the controller is scheduled at, which is the number the loop model wants.
 _DEFAULT_LOOP_RATE_HZ = 400.0
 
+#: PX4's own autotune publishes a status topic while it runs. ``state`` 0 is
+#: idle; anything else is a phase of the run, including the excitation phases.
+#: This is the PX4 counterpart of ArduPilot's autotune event codes and lands in
+#: the same canonical key, so nothing above the reader has to know which stack
+#: produced it.
+_AUTOTUNE_TOPIC = "autotune_attitude_control_status"
+
 #: ``sensor_gyro_fifo`` is the raw, unfiltered gyro. Its presence is worth a great
 #: deal -- it removes the need to reconstruct the pre-filter spectrum at all.
 _FIFO_TOPIC = "sensor_gyro_fifo"
 
 
-def read_px4(path: Path, progress: ProgressCallback | None = None) -> LogBundle:
-    """Read a PX4 ``.ulg`` into the canonical bundle."""
-    return PX4Reader(path).read(progress)
+def read_px4(
+    path: Path,
+    progress: ProgressCallback | None = None,
+    *,
+    kind: LogKind | None = None,
+) -> LogBundle:
+    """Read a PX4 ``.ulg`` into the canonical bundle.
+
+    Args:
+        kind: What the user says this flight was. Recorded on the bundle; the
+            reader itself does not act on it.
+    """
+    bundle = PX4Reader(path).read(progress)
+    return replace(bundle, declared_kind=kind) if kind is not None else bundle
 
 
 class PX4Reader(LogReader):
@@ -259,6 +283,43 @@ class PX4Reader(LogReader):
             out[f"imu.{instance}.clip"] = (t, np.asarray(total), "vehicle_imu_status")
         return out
 
+    def _autotune_windows(
+        self, datasets: dict[str, Any], grid: FloatArray
+    ) -> list[tuple[float, float]]:
+        """Stretches during which PX4's own autotune was running.
+
+        Contiguous runs of a non-idle ``state``, merged across the brief returns
+        to idle between axes: what the caller wants is "the aircraft was being
+        deliberately excited around here", and three windows separated by a
+        single sample of idle describe the same flight as one.
+        """
+        dataset = datasets.get(_AUTOTUNE_TOPIC)
+        if dataset is None:
+            return []
+        state = dataset.data.get("state")
+        if state is None:
+            return []
+        t = np.asarray(dataset.data["timestamp"], dtype=np.float64) / 1.0e6
+        active = np.asarray(state, dtype=np.float64) > 0.0
+        if not active.any():
+            return []
+
+        gap = 2.0 * float(np.median(np.diff(t))) if t.size > 1 else 0.0
+        windows: list[tuple[float, float]] = []
+        start: float | None = None
+        previous = 0.0
+        for time, on in zip(t, active, strict=True):
+            if on and start is None:
+                start = float(time)
+            elif not on and start is not None and float(time) - previous > gap:
+                windows.append((start, previous))
+                start = None
+            if on:
+                previous = float(time)
+        if start is not None:
+            windows.append((start, max(previous, float(grid[-1]) if grid.size else previous)))
+        return windows
+
     def _misc(self, datasets: dict[str, Any]) -> dict[str, tuple[FloatArray, FloatArray, str]]:
         """Battery and CPU load: the inputs to the operating point and the CPU gate."""
         out: dict[str, tuple[FloatArray, FloatArray, str]] = {}
@@ -321,6 +382,12 @@ class PX4Reader(LogReader):
                     key, t, y, source_msg=topic, filtered=topic in _POST_FILTER or None
                 ),
                 grid,
+            )
+
+        autotune = self._autotune_windows(datasets, grid)
+        if autotune:
+            signals["mode.autotune"] = gate_signal(
+                "mode.autotune", grid, autotune, source_msg=f"{_AUTOTUNE_TOPIC}.state"
             )
 
         if _FIFO_TOPIC not in datasets:

@@ -15,18 +15,21 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRadioButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
 )
 
-from rotorid.core.types import LogBundle
+from rotorid.core.logkind import capabilities, detect_kind, kind_evidence
+from rotorid.core.types import LogBundle, LogKind
 from rotorid.gui.state import AppState
 from rotorid.gui.theme import severity_colour
 from rotorid.gui.wizard.base import StageWidget
@@ -42,6 +45,31 @@ _WANTED: tuple[tuple[str, str, bool], ...] = (
     ("motor.0.output", "throttle, for the operating point and notch reference", False),
     ("esc.0.rpm", "ESC telemetry, without which a notch cannot track the motors", False),
     ("cpu.load", "scheduler load, which gates the expensive filter options", False),
+)
+
+
+#: The declaration, in the order it is offered. ``None`` is first and is the
+#: default: detection is right whenever the excitation is actually recorded,
+#: which is the only case where the choice changes anything. Offering it first
+#: also means the user who does not yet know the difference is not made to guess
+#: before they have seen the two descriptions underneath.
+_KIND_CHOICES: tuple[tuple[LogKind | None, str, str], ...] = (
+    (
+        None,
+        "Detect from the log",
+        "Read the file and decide: a recorded sweep or autotune run makes it a "
+        "tuning flight, anything else is a general flight.",
+    ),
+    (
+        "general",
+        "General flight",
+        capabilities("general").summary,
+    ),
+    (
+        "tuning",
+        "Tuning flight",
+        capabilities("tuning").summary,
+    ),
 )
 
 
@@ -66,6 +94,8 @@ class LoadStage(StageWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        layout.addWidget(self._build_kind_card(state))
+
         row = QHBoxLayout()
         self._choose = QPushButton("Choose log...")
         self._choose.setDefault(True)
@@ -81,6 +111,11 @@ class LoadStage(StageWidget):
         self._summary_card.setObjectName("Card")
         self._summary = QFormLayout(self._summary_card)
         layout.addWidget(self._summary_card)
+
+        self._verdict = QLabel()
+        self._verdict.setWordWrap(True)
+        self._verdict.setObjectName("Muted")
+        layout.addWidget(self._verdict)
 
         self._signals = QTreeWidget()
         self._signals.setColumnCount(3)
@@ -105,6 +140,40 @@ class LoadStage(StageWidget):
         state.log_failed.connect(self._on_failed)
         state.log_loading.connect(lambda path: self._status.setText(f"Reading {path}..."))
         self.refresh()
+
+    def _build_kind_card(self, state: AppState) -> QFrame:
+        """The one question the file cannot answer for itself (spec 5.2).
+
+        Asked *before* the file picker rather than after loading, because it
+        decides what the load is for. A user who has to open a log, read a
+        refusal and then find a setting has already been told the tool does not
+        work on their flight.
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        box = QVBoxLayout(card)
+        heading = QLabel("What kind of flight is this?")
+        heading.setObjectName("Subheading")
+        box.addWidget(heading)
+
+        self._kind_group = QButtonGroup(self)
+        self._kind_buttons: dict[LogKind | None, QRadioButton] = {}
+        for kind, label, blurb in _KIND_CHOICES:
+            button = QRadioButton(label)
+            button.setChecked(kind == state.declared_kind)
+            button.toggled.connect(
+                lambda checked, k=kind: self.state.declare_kind(k) if checked else None
+            )
+            self._kind_group.addButton(button)
+            self._kind_buttons[kind] = button
+            box.addWidget(button)
+
+            note = QLabel(blurb)
+            note.setObjectName("Muted")
+            note.setWordWrap(True)
+            note.setIndent(22)
+            box.addWidget(note)
+        return card
 
     # ----------------------------------------------------------------- #
 
@@ -144,6 +213,7 @@ class LoadStage(StageWidget):
             self._summary.removeRow(0)
         self._signals.clear()
         self._empty.setVisible(bundle is None)
+        self._verdict.setVisible(bundle is not None)
         self._signals.setVisible(bundle is not None)
         self._summary_card.setVisible(bundle is not None)
         if bundle is None:
@@ -151,6 +221,7 @@ class LoadStage(StageWidget):
 
         for label, value in (
             ("File", bundle.path.name),
+            ("Kind", self._kind_label(bundle)),
             ("Stack", bundle.stack),
             ("Firmware", bundle.firmware_version or "not recorded"),
             ("Board", bundle.board_id or "not recorded"),
@@ -168,7 +239,43 @@ class LoadStage(StageWidget):
             row.setStyleSheet(f"color: {severity_colour('warning')};")
             self._summary.addRow("Note", row)
 
+        self._fill_verdict(bundle)
         self._fill_signals(bundle)
+
+    @staticmethod
+    def _kind_label(bundle: LogBundle) -> str:
+        """The kind in force, and where it came from."""
+        label = capabilities(bundle.kind).label
+        return f"{label} (you said so)" if bundle.kind_was_declared else f"{label} (detected)"
+
+    def _fill_verdict(self, bundle: LogBundle) -> None:
+        """What the declaration costs or buys, said before the analysis runs.
+
+        A capped confidence rating discovered on the Review screen reads as the
+        tool being unsure of itself. The same cap, stated here as a consequence of
+        a choice the user just made, reads as the tool being precise about what
+        the flight can prove.
+        """
+        caps = capabilities(bundle.kind)
+        evidence = kind_evidence(bundle)
+        lines = [f"<b>Analysed as a {caps.label.lower()}.</b> {caps.summary}"]
+        if evidence:
+            lines.append("Deliberate excitation in this log: " + "; ".join(evidence) + ".")
+        else:
+            lines.append("No injected sweep or autotune run is recorded in this log.")
+        if bundle.kind_was_declared and detect_kind(bundle) != bundle.kind:
+            lines.append(
+                "<b>That disagrees with the file.</b> "
+                + (
+                    "Nothing in it was deliberately excited, so the axes below will be "
+                    "refused rather than identified."
+                    if bundle.kind == "tuning"
+                    else "The recorded excitation is not being used."
+                )
+            )
+        lines.extend(caps.limits)
+        self._verdict.setText("<br><br>".join(lines))
+        self._verdict.setVisible(True)
 
     def _fill_signals(self, bundle: LogBundle) -> None:
         for pattern, why, required in _WANTED:

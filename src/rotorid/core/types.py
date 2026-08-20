@@ -41,9 +41,11 @@ __all__ = [
     "GainSet",
     "LatencyBudget",
     "LogBundle",
+    "LogKind",
     "MarginReport",
     "MeasuredStep",
     "NoiseProfile",
+    "SegmentKind",
     "Session",
     "Signal",
     "SpectralPeak",
@@ -55,6 +57,16 @@ Axis = Literal["roll", "pitch", "yaw"]
 Stack = Literal["ardupilot", "px4"]
 Severity = Literal["blocker", "warning", "info", "good"]
 Confidence = Literal["high", "medium", "low"]
+
+#: Where a segment's excitation came from. Ordered here by how much the evidence
+#: is worth, which is also the order :mod:`rotorid.core.preprocess.segment`
+#: prefers them in.
+SegmentKind = Literal["systemid_chirp", "px4_autotune", "autotune_twitch", "pilot_input", "unknown"]
+
+#: What kind of flight a log is. Declared here because :class:`LogBundle` carries
+#: one; what each kind *means* -- and what it unlocks -- lives in
+#: :mod:`rotorid.core.logkind`, which imports this rather than restating it.
+LogKind = Literal["tuning", "general"]
 
 #: Canonical axis order. Iterate this, never a bare set, so output ordering is stable.
 AXES: tuple[Axis, ...] = ("roll", "pitch", "yaw")
@@ -180,6 +192,24 @@ class LogBundle:
     params: dict[str, float]
     batch: BatchSamples | None = None
     warnings: tuple[str, ...] = ()
+    #: What the user said this flight was: a deliberate tuning flight or an
+    #: ordinary one. ``None`` means nobody has said, and :attr:`kind` falls back
+    #: to what the log looks like. Kept separate from the detected value so a
+    #: disagreement between the two stays visible instead of being resolved
+    #: silently in favour of whichever was written last.
+    declared_kind: LogKind | None = None
+
+    @property
+    def kind(self) -> LogKind:
+        """The kind this log is being analysed as: declared if stated, else detected."""
+        from rotorid.core.logkind import detect_kind
+
+        return self.declared_kind if self.declared_kind is not None else detect_kind(self)
+
+    @property
+    def kind_was_declared(self) -> bool:
+        """Whether :attr:`kind` came from the user rather than from detection."""
+        return self.declared_kind is not None
 
     def signal(self, key: str) -> Signal:
         """Return one signal by canonical key.
@@ -220,7 +250,7 @@ class ExcitationSegment:
     axis: Axis
     t_start: float
     t_end: float
-    kind: Literal["systemid_chirp", "px4_autotune", "autotune_twitch", "pilot_input", "unknown"]
+    kind: SegmentKind
     amplitude_estimate: float
     confidence: float
     injection_point: str | None = None

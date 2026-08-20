@@ -111,7 +111,7 @@ def test_pipeline_uses_the_injected_chirp_when_it_is_available() -> None:
 
 def test_pipeline_refuses_an_axis_that_was_never_excited() -> None:
     bundle = _bundle(axis="roll")
-    with pytest.raises(ValueError, match="no usable excitation found on yaw"):
+    with pytest.raises(ValueError, match="nothing was deliberately excited on yaw"):
         identify_axis(bundle, "yaw", CONFIG)
 
 

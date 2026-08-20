@@ -9,6 +9,7 @@ that is silently empty.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -269,3 +270,75 @@ def test_a_log_can_be_dropped_on_the_window_not_only_on_the_load_page(
     assert empty_window.state.bundle is bundle
     # And it brings the user back to the page that describes what was just opened.
     assert empty_window.work.currentIndex() == 0
+
+
+def test_the_kind_of_flight_is_asked_before_the_file_is_chosen(empty_window) -> None:
+    """The one question the file cannot answer for itself (spec 5.2).
+
+    On the first screen, above the picker, because it decides what the load is
+    for. Discovering it after a refusal is discovering it too late.
+    """
+    stage = empty_window.load_stage
+    assert set(stage._kind_buttons) == {None, "general", "tuning"}
+    assert stage._kind_buttons[None].isChecked(), "detection is the default"
+    assert empty_window.state.declared_kind is None
+
+
+def test_choosing_a_kind_is_recorded_and_reaches_the_reader(
+    empty_window, qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The declaration has to arrive at the read, not be applied afterwards.
+
+    Which segments are searched for depends on it, so a bundle read one way and
+    relabelled the other is a lie every later stage builds on.
+    """
+    from rotorid.core.io import ardupilot
+
+    path = tmp_path / "flight.bin"
+    path.write_bytes(b"")
+    seen: list[object] = []
+
+    def reader(p, progress=None, *, kind=None):
+        seen.append(kind)
+        return dataclasses.replace(make_bundle(make_airframe(), make_chain()), declared_kind=kind)
+
+    monkeypatch.setattr(ardupilot, "read_ardupilot", reader)
+
+    empty_window.load_stage._kind_buttons["general"].setChecked(True)
+    assert empty_window.state.declared_kind == "general"
+
+    with qtbot.waitSignal(empty_window.state.log_loaded, timeout=60_000):
+        empty_window.state.load_log(path)
+    assert seen == ["general"]
+    assert empty_window.state.bundle.kind == "general"
+
+
+def test_changing_the_kind_re_reads_the_open_log(
+    empty_window, qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reinterpreting in place would leave the label and the segments disagreeing."""
+    from rotorid.core.io import ardupilot
+
+    path = tmp_path / "flight.bin"
+    path.write_bytes(b"")
+    reads: list[object] = []
+
+    def reader(p, progress=None, *, kind=None):
+        reads.append(kind)
+        return dataclasses.replace(make_bundle(make_airframe(), make_chain()), declared_kind=kind)
+
+    monkeypatch.setattr(ardupilot, "read_ardupilot", reader)
+    with qtbot.waitSignal(empty_window.state.log_loaded, timeout=60_000):
+        empty_window.state.load_log(path)
+
+    with qtbot.waitSignal(empty_window.state.log_loaded, timeout=60_000):
+        empty_window.state.declare_kind("tuning")
+
+    assert reads == [None, "tuning"]
+
+
+def test_the_load_page_says_what_the_declaration_costs(window) -> None:
+    """Stated where the choice was made, not discovered on the Review screen."""
+    text = window.load_stage._verdict.text()
+    assert "tuning flight" in text.lower()
+    assert not window.load_stage._verdict.isHidden()

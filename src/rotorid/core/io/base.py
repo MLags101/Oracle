@@ -10,7 +10,7 @@ does not recognize.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +22,7 @@ __all__ = [
     "LogReader",
     "ProgressCallback",
     "canonical_signal",
+    "gate_signal",
     "native_rate_hz",
     "signal_units",
 ]
@@ -53,6 +54,12 @@ CANONICAL_KEYS: dict[str, str] = {
     "batt.voltage": "V",
     "batt.current": "A",
     "cpu.load": "normalized",
+    # A gate rather than a measurement: 1 while the firmware's own autotune was
+    # running, 0 otherwise. Both stacks announce it, in completely different ways
+    # (ArduPilot in the event log, PX4 in a status topic), and every consumer
+    # wants the same question answered -- was the aircraft being deliberately
+    # excited here -- so the difference is resolved in the readers.
+    "mode.autotune": "normalized",
 }
 
 #: Keys that take an index, e.g. ``motor.3.rpm`` or ``imu.1.vibe.z``.
@@ -116,6 +123,38 @@ def canonical_signal(
         source_msg=source_msg,
         filtered=filtered,
         native_rate_hz=native_rate_hz(t),
+    )
+
+
+def gate_signal(
+    key: str,
+    grid: FloatArray,
+    windows: Sequence[tuple[float, float]],
+    *,
+    source_msg: str,
+) -> Signal:
+    """A 0/1 signal on the grid, 1 inside each of ``windows``.
+
+    Built directly rather than resampled. A gate is not a sampled quantity: a
+    cubic spline through a step rings, so a hold-based construction is the only
+    one whose output means what the name says at every sample.
+
+    The native rate is the grid rate by construction -- the windows are exact,
+    not sampled -- which keeps the evidence ceiling from being pulled down by a
+    flag that was written twice in a five-minute flight.
+    """
+    y = np.zeros_like(grid)
+    for start, end in windows:
+        y[(grid >= start) & (grid <= end)] = 1.0
+    units = signal_units(key)
+    rate = float(1.0 / (grid[1] - grid[0])) if grid.size > 1 else None
+    return Signal(
+        name=key,
+        t=grid,
+        y=y,
+        units=units,
+        source_msg=source_msg,
+        native_rate_hz=rate,
     )
 
 
