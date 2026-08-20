@@ -342,3 +342,92 @@ def test_the_load_page_says_what_the_declaration_costs(window) -> None:
     text = window.load_stage._verdict.text()
     assert "tuning flight" in text.lower()
     assert not window.load_stage._verdict.isHidden()
+
+
+# --------------------------------------------------------------------------- #
+# Validate (M10)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def closed_loop_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A window on a closed-loop flight, which is what validation needs.
+
+    The sweep fixture logs no rate setpoint, and everything the Validate stage
+    reads is a comparison of what was asked for against what happened.
+    """
+    from rotorid.core.io import ardupilot
+    from rotorid.gui.main_window import MainWindow
+    from tests.synthetic.closed_loop import make_closed_loop_bundle
+
+    path = tmp_path / "before.bin"
+    path.write_bytes(b"")
+    bundle = make_closed_loop_bundle(path="before.bin")
+    monkeypatch.setattr(ardupilot, "read_ardupilot", lambda p, **kw: bundle)
+
+    win = MainWindow(AppState())
+    qtbot.addWidget(win)
+    with qtbot.waitSignal(win.state.log_loaded, timeout=60_000):
+        win.state.load_log(path)
+    return win
+
+
+def test_validate_is_reachable_before_anything_has_been_analysed(closed_loop_window) -> None:
+    """A before/after on tracking error is worth having even with no model.
+
+    Gating this on a successful identification would shut the door on exactly the
+    user whose logs cannot be identified -- who is the user with the most to gain
+    from being told, in numbers, whether the change helped.
+    """
+    assert closed_loop_window.state.stage_ready("Validate")
+    row = STAGES.index("Validate")
+    closed_loop_window.rail.setCurrentRow(row)
+    assert closed_loop_window.work.currentIndex() == row
+
+
+def test_validate_says_it_is_not_a_validation_until_the_analysis_has_run(
+    closed_loop_window, qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The distinction the whole screen exists to protect."""
+    stage = closed_loop_window.validate_stage
+    after = tmp_path / "after.bin"
+    after.write_bytes(b"")
+
+    with qtbot.waitSignal(closed_loop_window.state.comparison_finished, timeout=180_000):
+        closed_loop_window.state.load_after_log(after)
+    stage.refresh()
+
+    assert "not a validation" in stage._scope.text()
+    assert closed_loop_window.state.comparison is not None
+
+
+def test_with_an_analysis_the_prediction_is_on_the_screen(
+    closed_loop_window, qtbot, tmp_path: Path
+) -> None:
+    stage = closed_loop_window.validate_stage
+    with qtbot.waitSignal(closed_loop_window.state.analysis_finished, timeout=180_000):
+        closed_loop_window.state.run_analysis(("roll",))
+
+    after = tmp_path / "after.bin"
+    after.write_bytes(b"")
+    with qtbot.waitSignal(closed_loop_window.state.comparison_finished, timeout=180_000):
+        closed_loop_window.state.load_after_log(after)
+    stage.refresh()
+
+    assert "This is a validation" in stage._scope.text()
+    assert stage._table.topLevelItemCount() >= 1
+    assert stage._table.topLevelItem(0).text(0) == "roll"
+
+
+def test_loading_a_second_log_does_not_throw_the_first_one_away(
+    closed_loop_window, qtbot, tmp_path: Path
+) -> None:
+    """The whole point of the screen is that both logs are on it at once."""
+    before = closed_loop_window.state.bundle
+    after = tmp_path / "after.bin"
+    after.write_bytes(b"")
+    with qtbot.waitSignal(closed_loop_window.state.comparison_finished, timeout=180_000):
+        closed_loop_window.state.load_after_log(after)
+
+    assert closed_loop_window.state.bundle is before
+    assert closed_loop_window.state.after is not None

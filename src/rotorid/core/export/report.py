@@ -33,9 +33,12 @@ from rotorid.core.types import (
     TuneRecommendation,
 )
 
-__all__ = ["write_report"]
+__all__ = ["STYLE", "findings_section", "table", "write_report"]
 
-_STYLE = """
+#: Shared by the session report and the validation report. One stylesheet rather
+#: than two, because the two documents sit side by side in a user's folder and a
+#: reader who has learned to read one should not have to relearn the other.
+STYLE = """
 :root { color-scheme: light dark; --fg: #16181d; --muted: #5b6270; --bg: #ffffff;
         --rule: #d7dbe2; --accent: #1f6feb; --warn: #b8500f; }
 @media (prefers-color-scheme: dark) {
@@ -96,7 +99,7 @@ def write_report(
     parts = [
         _header(bundle, config_hash, tool_version),
         _safety_block(),
-        _findings_section(findings),
+        findings_section(findings),
     ]
     for axis, rec in recommendations.items():
         parts.append(_axis_section(axis, rec, bundle.params, (measured_steps or {}).get(axis)))
@@ -109,7 +112,7 @@ def write_report(
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>RotorID report - {html.escape(bundle.path.name)}</title>"
-        f"<style>{_STYLE}</style></head><body>{''.join(parts)}</body></html>"
+        f"<style>{STYLE}</style></head><body>{''.join(parts)}</body></html>"
     )
     path.write_text(document, encoding="utf-8")
     return path
@@ -172,7 +175,7 @@ def _axis_section(
         f"<code>{html.escape(rec.binding_constraint)}</code> &mdash; this is what "
         f"stops the gains going higher. Confidence: {html.escape(rec.confidence)}.</div>"
         "<h3>Gains</h3>"
-        + _table(
+        + table(
             ("Gain", "Current", "Recommended", "Change"),
             [
                 (
@@ -186,9 +189,9 @@ def _axis_section(
             numeric_from=1,
         )
         + "<h3>Identified airframe</h3>"
-        + _model_table(rec)
+        + _modeltable(rec)
         + "<h3>Achieved margins</h3>"
-        + _table(
+        + table(
             ("Metric", "Value", "Unit"),
             [(label, value, unit) for label, value, unit in rows],
             numeric_from=1,
@@ -212,7 +215,7 @@ def _estimator_phrase(model: AirframeModel) -> str:
     return "nothing independent was available -- estimate is biased by feedback"
 
 
-def _model_table(rec: TuneRecommendation) -> str:
+def _modeltable(rec: TuneRecommendation) -> str:
     model = rec.model
     rows = [(name, f"{value:.4g}") for name, value in sorted(model.params.items())]
     rows += [
@@ -223,7 +226,7 @@ def _model_table(rec: TuneRecommendation) -> str:
         ("filters removed by", model.filter_deconvolution),
         ("loop removed by", _estimator_phrase(model)),
     ]
-    return _table(("Quantity", "Value"), rows, numeric_from=1)
+    return table(("Quantity", "Value"), rows, numeric_from=1)
 
 
 def _step_table(rec: TuneRecommendation, measured: MeasuredStep | None = None) -> str:
@@ -242,16 +245,16 @@ def _step_table(rec: TuneRecommendation, measured: MeasuredStep | None = None) -
         ("Settling time (2%)", f"{s.settling_time_s * 1000.0:.0f} ms"),
         ("Peak time", f"{s.peak_time_s * 1000.0:.0f} ms"),
     ]
-    table = _table(("Metric", "Recommended tune, predicted"), rows, numeric_from=1)
+    predicted = table(("Metric", "Recommended tune, predicted"), rows, numeric_from=1)
     if measured is None:
-        return table + (
+        return predicted + (
             "<p class='note'>The step the aircraft actually flew could not be measured "
             "from this log. That needs a rate setpoint that moved: a flight spent holding "
             "still has nothing to deconvolve.</p>"
         )
 
     m = measured.metrics
-    flown = _table(
+    flown = table(
         ("Metric", "Flown tune, measured from the log"),
         [
             ("Rise time (10-90%)", f"{m.rise_time_s * 1000.0:.0f} ms"),
@@ -265,7 +268,9 @@ def _step_table(rec: TuneRecommendation, measured: MeasuredStep | None = None) -
         numeric_from=1,
     )
     return (
-        table + flown + "<p class='note'>The two columns describe different tunes -- the one being "
+        predicted
+        + flown
+        + "<p class='note'>The two columns describe different tunes -- the one being "
         "recommended and the one that was flown -- so they are not expected to match. "
         "What the measured column is for is checking the model against reality: the "
         "STEP_RESPONSE findings compare it against what this model predicts the "
@@ -283,7 +288,7 @@ def _log_section(bundle: LogBundle) -> str:
     )
     return (
         "<h2>Log</h2>"
-        + _table(
+        + table(
             ("Property", "Value"),
             [
                 ("File", bundle.path.name),
@@ -305,7 +310,7 @@ def _log_section(bundle: LogBundle) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _table(
+def table(
     headers: Sequence[str],
     rows: Sequence[Sequence[str]],
     *,
@@ -377,7 +382,7 @@ def _filter_section(rec: TuneRecommendation, flown: dict[str, float]) -> str:
 
     if filters.params:
         parts.append(
-            _table(
+            table(
                 ("Parameter", "Current", "Recommended"),
                 [
                     (
@@ -503,7 +508,7 @@ _SEVERITY_LABEL = {
 }
 
 
-def _findings_section(findings: tuple[Finding, ...]) -> str:
+def findings_section(findings: tuple[Finding, ...]) -> str:
     """What the tool noticed, worst first, each with the evidence behind it."""
     if not findings:
         return ""
@@ -547,7 +552,7 @@ def _plan_section(plan: FlightTestPlan) -> str:
 
     blocks = [f"<h2>Next flights</h2><div class='note'>{html.escape(plan.preamble)}</div>"]
     for stage in plan.stages:
-        changes = _table(
+        changes = table(
             ("Parameter", "Set to"),
             [(name, f"{value:g}") for name, value in sorted(stage.changes.items())],
             numeric_from=1,

@@ -15,14 +15,15 @@ import json
 import math
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
 from rotorid import __version__
 from rotorid.config import load_config
+from rotorid.core.export.profile import PROFILES, Profile
 from rotorid.core.logkind import KINDS
-from rotorid.core.types import AXES, Axis, LogBundle, LogKind
+from rotorid.core.types import AXES, Axis, LogBundle, LogKind, Stack
 
 __all__ = ["main"]
 
@@ -106,6 +107,76 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--json", action="store_true")
     analyze.set_defaults(handler=_cmd_analyze)
+
+    filters = sub.add_parser(
+        "filters",
+        help="filter recommendation only, without identifying the airframe",
+    )
+    filters.add_argument("log", type=Path)
+    filters.add_argument("--axes", default="roll,pitch,yaw", help="comma-separated axis list")
+    _add_kind_argument(filters)
+    filters.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    filters.add_argument("--json", action="store_true")
+    filters.set_defaults(handler=_cmd_filters)
+
+    validate = sub.add_parser(
+        "validate",
+        help="compare two flights: did the change do what the tool said it would",
+    )
+    validate.add_argument("before", type=Path, help="the log the recommendation came from")
+    validate.add_argument("after", type=Path, help="a log flown after applying it")
+    validate.add_argument(
+        "--session",
+        type=Path,
+        default=None,
+        help="the .rotorid saved from the 'before' analysis. Without it this is an "
+        "outcome comparison rather than a validation: nothing records what was predicted",
+    )
+    validate.add_argument("--axes", default="roll,pitch,yaw", help="comma-separated axis list")
+    validate.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    validate.add_argument("-o", "--report", type=Path, default=None, help="write an HTML report")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(handler=_cmd_validate)
+
+    report = sub.add_parser("report", help="re-render the HTML report from a saved session")
+    report.add_argument("session", type=Path)
+    report.add_argument("-o", "--report", type=Path, required=True)
+    report.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    report.set_defaults(handler=_cmd_report)
+
+    recommend = sub.add_parser("recommend", help="write .param files from a saved session")
+    recommend.add_argument("session", type=Path)
+    recommend.add_argument(
+        "-o", "--export", type=Path, required=True, metavar="DIR", help="directory to write into"
+    )
+    recommend.add_argument(
+        "--stage",
+        type=int,
+        default=None,
+        help="write only this flight from the staged plan, by its number",
+    )
+    recommend.add_argument(
+        "--acknowledge",
+        default="",
+        help="comma-separated finding codes to accept, unblocking the export",
+    )
+    recommend.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    recommend.set_defaults(handler=_cmd_recommend)
+
+    profile = sub.add_parser(
+        "profile", help="write a data-collection parameter file to load before flying"
+    )
+    profile.add_argument("--stack", choices=("ardupilot", "px4"), required=True)
+    profile.add_argument(
+        "--which",
+        choices=PROFILES,
+        default="collect",
+        help="'collect' turns on the logging the analysis needs; 'sweep' also configures "
+        "the excitation, and must be turned off again afterwards",
+    )
+    profile.add_argument("--axis", choices=AXES, default="roll", help="axis for the sweep")
+    profile.add_argument("-o", "--out", type=Path, required=True)
+    profile.set_defaults(handler=_cmd_profile)
 
     gui = sub.add_parser("gui", help="open the interactive window")
     gui.add_argument("log", type=Path, nargs="?", default=None)
@@ -261,10 +332,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     bundle = _read(args.log, _declared_kind(args))
     config = load_config(args.config)
-    axes = [a.strip() for a in args.axes.split(",") if a.strip()]
-    unknown = [a for a in axes if a not in AXES]
-    if unknown:
-        raise ValueError(f"unknown axes {unknown}; choose from {list(AXES)}")
+    axes = _axes_from(args)
 
     acknowledgements = {
         code.strip(): "accepted on the command line"
@@ -273,7 +341,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     }
     result = analyze(
         bundle,
-        tuple(cast("Axis", a) for a in axes),
+        axes,
         config,
         tool_version=__version__,
         conservatism=args.conservatism,
@@ -370,6 +438,263 @@ def _rewrite_for_a_packaged_build(argv: Sequence[str] | None) -> Sequence[str] |
     if len(values) == 1 and not values[0].startswith("-") and Path(values[0]).is_file():
         return ["gui", values[0]]
     return argv
+
+
+def _axes_from(args: argparse.Namespace) -> tuple[Axis, ...]:
+    """The ``--axes`` list, validated once rather than in each command."""
+    axes = [a.strip() for a in args.axes.split(",") if a.strip()]
+    unknown = [a for a in axes if a not in AXES]
+    if unknown:
+        raise ValueError(f"unknown axes {unknown}; choose from {list(AXES)}")
+    return tuple(cast("Axis", a) for a in axes)
+
+
+def _cmd_filters(args: argparse.Namespace) -> int:
+    """Filter recommendation only -- the fast path (spec 14).
+
+    Deliberately reports the noise and the flown chain rather than a designed
+    tune. Noise analysis needs a spectrum and a filter chain; neither needs a
+    model of the aircraft, so a user whose log has no usable excitation can still
+    be told that their notch is chasing the wrong line. Refusing to answer that
+    because the *gain* half is impossible would be refusing the half that was
+    possible.
+    """
+    from rotorid.core.design.recommend import identify_axis
+
+    bundle = _read(args.log, _declared_kind(args))
+    config = load_config(args.config)
+    payload: dict[str, Any] = {"path": str(bundle.path), "stack": bundle.stack, "axes": {}}
+    failures: dict[str, str] = {}
+
+    for axis in _axes_from(args):
+        try:
+            analysis = identify_axis(bundle, axis, config)
+        except ValueError as exc:
+            failures[axis] = str(exc)
+            continue
+        if analysis.noise is None:
+            failures[axis] = "no usable noise measurement in this log"
+            continue
+        payload["axes"][axis] = {
+            "peaks": [
+                {
+                    "f_hz": round(p.f_hz, 1),
+                    "kind": p.kind,
+                    "magnitude_db": round(p.magnitude_db, 1),
+                }
+                for p in analysis.noise.peaks
+            ],
+            "flown_chain": _jsonable(analysis.chain),
+            "pre_filter_source": analysis.noise.pre_filter_source,
+        }
+    payload["failures"] = failures
+
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return EXIT_OK if payload["axes"] else EXIT_BLOCKED
+
+    print(f"{bundle.path.name}  [{bundle.stack}]")
+    for name, found in payload["axes"].items():
+        print(f"\n{name}: gyro noise, {found['pre_filter_source']} pre-filter spectrum")
+        for peak in found["peaks"]:
+            print(f"    {peak['f_hz']:7.1f} Hz  {peak['magnitude_db']:+6.1f} dB  {peak['kind']}")
+        if not found["peaks"]:
+            print("    no peaks stand above the floor")
+    for name, why in failures.items():
+        print(f"\n{name}: {why}")
+    return EXIT_OK if payload["axes"] else EXIT_BLOCKED
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    """Compare two flights, and say whether the prediction held (spec 5.10)."""
+    from rotorid.core.analysis.compare import compare_logs
+    from rotorid.core.export.comparison import write_comparison
+    from rotorid.core.export.session import load_session
+    from rotorid.core.guidance.validation import validation_findings
+
+    config = load_config(args.config)
+    before = _read(args.before)
+    after = _read(args.after)
+    session = None
+    if args.session is not None:
+        session, mismatch = load_session(
+            args.session, tool_version=__version__, config_hash=config.hash
+        )
+        if mismatch:
+            print(f"note: {mismatch.describe()}", file=sys.stderr)
+
+    report = compare_logs(
+        before,
+        after,
+        config,
+        tool_version=__version__,
+        session=session,
+        axes=_axes_from(args),
+    )
+    findings = validation_findings(report)
+    if args.report is not None:
+        write_comparison(args.report, report)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "before": str(before.path),
+                    "after": str(after.path),
+                    "validated": report.has_predictions,
+                    "axes": {
+                        axis: {
+                            "tracking_change": c.tracking_change,
+                            "dterm_change": c.dterm_change,
+                            "rise_ratio": c.rise_ratio,
+                            "prediction_holds": c.prediction_holds,
+                            "filter_prediction_error_db": c.filter_prediction_error_db,
+                            "applied": c.applied,
+                        }
+                        for axis, c in report.axes.items()
+                    },
+                    "findings": [_jsonable(f) for f in findings],
+                },
+                indent=2,
+                default=str,
+            )
+        )
+    else:
+        print(f"{before.path.name} -> {after.path.name}  [{after.stack}]")
+        if not report.has_predictions:
+            print(
+                "  outcome comparison only: pass --session to check what was predicted "
+                "against what happened"
+            )
+        for axis, c in report.axes.items():
+            print(
+                f"  {axis:<6} tracking {_pct(c.tracking_change):>9}   "
+                f"D-term {_pct(c.dterm_change):>9}   prediction {_verdict_word(c)}"
+            )
+        for note in report.notes:
+            print(f"  . {note}")
+        _print_findings(findings)
+        if args.report is not None:
+            print(f"\nwrote {args.report}")
+
+    # A missed prediction is not a broken run, but it is a result a script should
+    # be able to branch on without parsing prose.
+    missed = any(f.code in ("PREDICTION_MISSED", "FILTER_PREDICTION_MISSED") for f in findings)
+    return EXIT_BLOCKED if missed else EXIT_OK
+
+
+def _pct(change: float | None) -> str:
+    return "n/a" if change is None else f"{change * 100:+.0f}%"
+
+
+def _verdict_word(comparison: Any) -> str:
+    """One word for the prediction column, or why there is not one."""
+    if comparison.predicted_step is None:
+        return "not tested"
+    if comparison.applied is False:
+        return "gains not applied"
+    holds = comparison.prediction_holds
+    return "not measurable" if holds is None else ("confirmed" if holds else "MISSED")
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    """Re-render the HTML report from a saved session, without the log."""
+    from rotorid.core.export.report import write_report
+    from rotorid.core.export.session import load_session
+
+    config = load_config(args.config)
+    session, mismatch = load_session(
+        args.session, tool_version=__version__, config_hash=config.hash
+    )
+    if mismatch:
+        print(f"note: {mismatch.describe()}", file=sys.stderr)
+    if not session.recommendations:
+        raise ValueError(f"{args.session.name} has no recommendation in it to report on")
+
+    write_report(
+        args.report,
+        session.log,
+        {str(a): r for a, r in session.recommendations.items()},
+        config_hash=session.config_hash,
+        tool_version=session.tool_version,
+        findings=session.findings,
+        plan=session.next_steps,
+        measured_steps={str(a): m for a, m in session.measured_steps.items()},
+    )
+    print(f"wrote {args.report}")
+    return EXIT_OK
+
+
+def _cmd_recommend(args: argparse.Namespace) -> int:
+    """Write the staged .param files from a saved session.
+
+    Split out from ``analyze`` so an export can be redone -- with a finding
+    acknowledged, or into a different directory -- without re-reading the log.
+    Re-analysing in order to re-export would also risk producing different
+    numbers under a different tool version, which is the one thing a saved
+    session exists to prevent.
+    """
+    from rotorid.core.export.params import write_param_files
+    from rotorid.core.export.session import load_session
+
+    config = load_config(args.config)
+    session, mismatch = load_session(
+        args.session, tool_version=__version__, config_hash=config.hash
+    )
+    if mismatch:
+        print(f"note: {mismatch.describe()}", file=sys.stderr)
+    plan = session.next_steps
+    if plan is None or not plan.stages:
+        raise ValueError(f"{args.session.name} carries no flight plan to export")
+
+    acknowledgements = {
+        **session.acknowledgements,
+        **{
+            code.strip(): "accepted on the command line"
+            for code in args.acknowledge.split(",")
+            if code.strip()
+        },
+    }
+    if args.stage is not None:
+        stages = tuple(s for s in plan.stages if s.index == args.stage)
+        if not stages:
+            available = ", ".join(str(s.index) for s in plan.stages)
+            raise ValueError(f"no flight {args.stage} in this plan; it has {available}")
+        plan = replace(plan, stages=stages)
+
+    args.export.mkdir(parents=True, exist_ok=True)
+    written = write_param_files(
+        args.export,
+        plan,
+        log_name=session.log.path.name,
+        tool_version=session.tool_version,
+        config_hash=session.config_hash,
+        findings=session.findings,
+        acknowledgements=acknowledgements,
+    )
+    for path in written:
+        print(f"wrote {path}")
+    return EXIT_OK
+
+
+def _cmd_profile(args: argparse.Namespace) -> int:
+    """Write the parameter file to load *before* the flight (spec 13)."""
+    from rotorid.core.export.profile import write_profile
+
+    write_profile(
+        args.out,
+        cast("Stack", args.stack),
+        cast("Profile", args.which),
+        tool_version=__version__,
+        axis=cast("Axis", args.axis),
+    )
+    print(f"wrote {args.out}")
+    if args.which == "sweep":
+        print(
+            "this profile arms a deliberate excitation. Read the header before loading "
+            "it, and turn it off again when the tuning campaign is over."
+        )
+    return EXIT_OK
 
 
 def _cmd_selftest(args: argparse.Namespace) -> int:

@@ -274,3 +274,152 @@ def test_arguments_passed_in_are_never_answered_with_a_window(
     monkeypatch.setattr(cli, "_open_window_without_a_log", _refuse)
     assert cli.main([]) == cli.EXIT_OK
     assert "usage:" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# The commands the specification promises (spec section 14)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_kind_of_log_can_be_declared_on_the_command_line(
+    synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one thing the file cannot tell the tool, so the tool has to be told."""
+    assert cli.main(["inspect", str(synthetic_log), "--kind", "general", "--json"]) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "general"
+    assert payload["kind_declared"] is True
+    assert payload["kind_detected"] == "tuning"
+    assert payload["limits"], "a declaration that costs something has to say so"
+
+
+def test_inspect_says_which_kind_it_read_the_log_as(
+    synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["inspect", str(synthetic_log)]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "tuning flight" in out
+    assert "detected" in out
+
+
+def test_filters_reports_the_noise_without_designing_a_tune(
+    synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fast path: a spectrum and a chain, no gains."""
+    assert cli.main(["filters", str(synthetic_log), "--axes", "roll", "--json"]) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert "roll" in payload["axes"]
+    assert "peaks" in payload["axes"]["roll"]
+    assert "gains" not in json.dumps(payload)
+
+
+def test_profile_writes_a_file_that_says_what_it_changes(tmp_path: Path) -> None:
+    out = tmp_path / "collect.param"
+    assert cli.main(["profile", "--stack", "ardupilot", "-o", str(out)]) == cli.EXIT_OK
+    text = out.read_text(encoding="utf-8")
+    assert "LOG_BITMASK" in text
+    assert "BACK UP YOUR CURRENT PARAMETERS" in text
+    assert "ATTITUDE_FAST" in text
+
+
+def test_the_sweep_profile_warns_that_it_arms_an_excitation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It is not a logging change. The next arming injects a chirp into the loop."""
+    out = tmp_path / "sweep.param"
+    argv = ["profile", "--stack", "ardupilot", "--which", "sweep", "--axis", "pitch"]
+    assert cli.main([*argv, "-o", str(out)]) == cli.EXIT_OK
+    text = out.read_text(encoding="utf-8")
+    assert "SID_AXIS,8" in text
+    assert "SET SID_AXIS BACK TO 0" in text
+    assert "arms a deliberate excitation" in capsys.readouterr().out
+
+
+def test_px4_gets_an_autotune_profile_rather_than_a_sweep(tmp_path: Path) -> None:
+    """PX4 has no SYSTEMID mode, and pretending otherwise would export nothing usable."""
+    out = tmp_path / "px4.param"
+    assert (
+        cli.main(["profile", "--stack", "px4", "--which", "sweep", "-o", str(out)]) == cli.EXIT_OK
+    )
+    text = out.read_text(encoding="utf-8")
+    assert "MC_AT_EN,1" in text
+    assert "MC_AT_APPLY,0" in text
+    assert "SID_AXIS" not in text
+
+
+def test_report_re_renders_from_a_session_without_the_log(
+    synthetic_log: Path, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "flight.rotorid"
+    assert (
+        cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+        == cli.EXIT_OK
+    )
+    synthetic_log.unlink()
+
+    out = tmp_path / "report.html"
+    assert cli.main(["report", str(bundle), "-o", str(out)]) == cli.EXIT_OK
+    assert out.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_recommend_exports_from_a_session_without_re_analysing(
+    synthetic_log: Path, tmp_path: Path
+) -> None:
+    """Re-analysing to re-export risks different numbers from a different build."""
+    bundle = tmp_path / "flight.rotorid"
+    assert (
+        cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+        == cli.EXIT_OK
+    )
+    synthetic_log.unlink()
+
+    out = tmp_path / "params"
+    assert cli.main(["recommend", str(bundle), "-o", str(out)]) == cli.EXIT_OK
+    written = sorted(out.glob("*.param"))
+    assert written
+    assert "RotorID" in written[0].read_text(encoding="utf-8")
+
+
+def test_recommend_can_write_one_flight_of_the_plan(synthetic_log: Path, tmp_path: Path) -> None:
+    bundle = tmp_path / "flight.rotorid"
+    cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+
+    out = tmp_path / "one"
+    assert cli.main(["recommend", str(bundle), "-o", str(out), "--stage", "1"]) == cli.EXIT_OK
+    assert len(sorted(out.glob("*.param"))) == 1
+
+
+def test_asking_for_a_flight_that_is_not_in_the_plan_says_which_are(
+    synthetic_log: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bundle = tmp_path / "flight.rotorid"
+    cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+
+    out = tmp_path / "none"
+    assert cli.main(["recommend", str(bundle), "-o", str(out), "--stage", "99"]) == cli.EXIT_BLOCKED
+    assert "no flight 99" in capsys.readouterr().err
+
+
+def test_validate_compares_two_logs(
+    synthetic_log: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = tmp_path / "after.bin"
+    other.write_bytes(b"")
+    report = tmp_path / "comparison.html"
+    assert (
+        cli.main(
+            [
+                "validate",
+                str(synthetic_log),
+                str(other),
+                "--axes",
+                "roll",
+                "-o",
+                str(report),
+            ]
+        )
+        == cli.EXIT_OK
+    )
+    out = capsys.readouterr().out
+    assert "outcome comparison only" in out, "without a session it must not claim to validate"
+    assert report.exists()

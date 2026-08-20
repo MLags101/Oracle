@@ -39,6 +39,7 @@ STAGES: tuple[Stage, ...] = (
     "Design",
     "Review & Export",
     "Next Flight",
+    "Validate",
 )
 
 
@@ -59,6 +60,10 @@ class AppState(QObject):
     busy_changed = Signal(bool)
     kind_changed = Signal(object)  # LogKind | None
 
+    after_loaded = Signal(object)  # LogBundle
+    comparison_finished = Signal(object)  # ValidationReport
+    comparison_failed = Signal(str, str)
+
     def __init__(self, config: Config | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.config = config if config is not None else load_config()
@@ -72,6 +77,12 @@ class AppState(QObject):
         self.declared_kind: LogKind | None = None
         self.conservatism = 0.5
         self.acknowledgements: dict[str, str] = {}
+        #: The second flight, for validation mode. Held beside the analysis
+        #: rather than replacing it: the whole point of the screen is that both
+        #: logs are on it at once, and loading the after-log through the ordinary
+        #: path would throw the before-log away.
+        self.after: LogBundle | None = None
+        self.comparison: Any = None  # ValidationReport, imported lazily
 
         self._pool = QThreadPool(self)
         # One at a time. Two analyses of the same log racing to finish would
@@ -130,6 +141,66 @@ class AppState(QObject):
         assert isinstance(bundle, LogBundle)
         self.bundle = bundle
         self.log_loaded.emit(bundle)
+
+    # ----------------------------------------------------------------- #
+    # Validation (spec 5.10)
+    # ----------------------------------------------------------------- #
+
+    def load_after_log(self, path: Path) -> None:
+        """Read a second flight to compare the first against, off the GUI thread.
+
+        Read with no declared kind, deliberately. Validation never identifies
+        anything -- everything it reads comes off the signals directly -- so the
+        question the declaration answers does not arise, and asking it again
+        would imply the after-log needed a sweep in it.
+        """
+        from rotorid.core.io.ardupilot import read_ardupilot
+        from rotorid.core.io.px4 import read_px4
+
+        reader = read_px4 if path.suffix.lower() == ".ulg" else read_ardupilot
+        self.after = None
+        self.comparison = None
+        self._start(
+            Job(reader, path, wants_progress=False),
+            on_finished=self._after_ready,
+            on_failed=self.comparison_failed.emit,
+        )
+
+    def _after_ready(self, bundle: object) -> None:
+        assert isinstance(bundle, LogBundle)
+        self.after = bundle
+        self.after_loaded.emit(bundle)
+        self.run_comparison()
+
+    def run_comparison(self) -> None:
+        """Compare the two loaded logs, using the analysis if one has been run.
+
+        The session is passed when there is one and omitted when there is not,
+        which is the difference between a validation and an outcome comparison.
+        The screen says which it is showing; this only decides which it can.
+        """
+        from rotorid.core.analysis.compare import compare_logs
+
+        if self.bundle is None or self.after is None:
+            raise RuntimeError("validation needs two logs")
+
+        self._start(
+            Job(
+                compare_logs,
+                self.bundle,
+                self.after,
+                self.config,
+                tool_version=__version__,
+                session=self.result.session if self.result is not None else None,
+                wants_progress=False,
+            ),
+            on_finished=self._comparison_ready,
+            on_failed=self.comparison_failed.emit,
+        )
+
+    def _comparison_ready(self, report: object) -> None:
+        self.comparison = report
+        self.comparison_finished.emit(report)
 
     # ----------------------------------------------------------------- #
     # Analysis
@@ -227,6 +298,13 @@ class AppState(QObject):
             return False
         if stage in ("Health & Noise", "Segment"):
             return True
+        # Validation compares two flights and identifies neither, so it opens as
+        # soon as there is a first log. Requiring an analysis first would shut
+        # the door on the user whose after-log is the one they can read: a
+        # before/after on tracking error and D-term noise is worth having even
+        # when nothing could be identified from either flight.
+        if stage == "Validate":
+            return True
         return self.result is not None and bool(self.result.session.recommendations)
 
     # ----------------------------------------------------------------- #
@@ -236,6 +314,8 @@ class AppState(QObject):
     def _clear(self) -> None:
         self.bundle = None
         self.result = None
+        self.after = None
+        self.comparison = None
         self.acknowledgements.clear()
 
     def _start(

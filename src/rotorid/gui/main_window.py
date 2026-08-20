@@ -44,6 +44,7 @@ from rotorid.gui.wizard.load import LoadStage
 from rotorid.gui.wizard.nextflight import NextFlightStage
 from rotorid.gui.wizard.review import ReviewStage
 from rotorid.gui.wizard.segment import SegmentStage
+from rotorid.gui.wizard.validate import ValidateStage
 
 __all__ = ["MainWindow"]
 
@@ -76,6 +77,7 @@ class MainWindow(QMainWindow):
         self.state.analysis_started.connect(lambda: self._say("Analysing..."))
         self.state.busy_changed.connect(self._busy)
         self.state.acknowledgements_changed.connect(self._refresh_findings)
+        self.state.comparison_failed.connect(self._failed)
 
         self._select(0)
 
@@ -106,6 +108,7 @@ class MainWindow(QMainWindow):
         self.health_stage = HealthStage(self.state)
         self.segment_stage = SegmentStage(self.state)
         self.nextflight_stage = NextFlightStage(self.state)
+        self.validate_stage = ValidateStage(self.state)
         built: dict[str, StageWidget] = {
             "Load": self.load_stage,
             "Health & Noise": self.health_stage,
@@ -115,6 +118,7 @@ class MainWindow(QMainWindow):
             "Design": self.design_stage,
             "Review & Export": self.review_stage,
             "Next Flight": self.nextflight_stage,
+            "Validate": self.validate_stage,
         }
         for name in STAGES:
             stage = built[name]
@@ -163,6 +167,9 @@ class MainWindow(QMainWindow):
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.load_stage.open_log_dialog)
         file_menu.addAction(open_action)
+        compare_action = QAction("Open an &after-flight log to validate against...", self)
+        compare_action.triggered.connect(self._open_after)
+        file_menu.addAction(compare_action)
         file_menu.addAction(run)
 
     # ----------------------------------------------------------------- #
@@ -174,12 +181,32 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
+        """A dropped log opens as a new before-log, and takes the user to it.
+
+        Except on the Validate stage, which has its own drop handler and its own
+        meaning for a second file. Qt delivers to the child first, so this is
+        only reached when the drop landed on the window rather than on that
+        stage -- but the stage is where a user with two logs in mind will be
+        standing, and getting this backwards would silently discard their
+        analysis.
+        """
         urls = event.mimeData().urls()
         if not urls:
             return
         self._select(0)
         self.state.load_log(Path(urls[0].toLocalFile()))
         event.acceptProposedAction()
+
+    def _open_after(self) -> None:
+        """Jump to the Validate stage and ask for the second log there.
+
+        Rather than loading it from wherever the user happens to be: the file
+        only means anything next to the screen that explains what is being
+        compared, and arriving at a filled-in table with no context is how a
+        comparison gets read as a verdict.
+        """
+        self._select(STAGES.index("Validate"))
+        self.validate_stage.open_after_dialog()
 
     def _run(self) -> None:
         if self.state.bundle is None:
