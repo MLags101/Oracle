@@ -20,6 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["PySide6>=6.6", "pyqtgraph>=0.13"]
 dev = ["pytest>=8.0", "pytest-qt>=4.4", "ruff>=0.6", "mypy>=1.11"]
+# Only needed to run build.py, and only on the platform being built for --
+# PyInstaller bundles this interpreter and cannot cross-compile.
+build = ["pyinstaller>=6.0"]
 
 [project.scripts]
 rotorid = "rotorid.cli:main"

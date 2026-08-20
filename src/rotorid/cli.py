@@ -40,6 +40,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     one that had to be started from a terminal. Printing help stays the fallback
     for an install without the GUI extra.
     """
+    argv = _rewrite_for_a_packaged_build(argv)
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -107,6 +108,24 @@ def _build_parser() -> argparse.ArgumentParser:
     gui.add_argument("log", type=Path, nargs="?", default=None)
     gui.add_argument("--theme", choices=("light", "dark"), default="light")
     gui.set_defaults(handler=_cmd_gui)
+
+    selftest = sub.add_parser("selftest", help="check that this build actually works")
+    selftest.add_argument(
+        "log",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="a log to read. Without one the message definitions are never exercised, "
+        "which is the part of a packaged build most likely to be missing",
+    )
+    selftest.add_argument(
+        "--out", type=Path, default=None, help="write the result here as well as to stdout"
+    )
+    selftest.add_argument(
+        "--no-gui", action="store_true", help="skip the window, for a headless install"
+    )
+    selftest.add_argument("--json", action="store_true")
+    selftest.set_defaults(handler=_cmd_selftest)
 
     session = sub.add_parser("session", help="reopen a saved .rotorid analysis")
     session.add_argument("session", type=Path)
@@ -286,6 +305,41 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         )
         return EXIT_BLOCKED
     return EXIT_OK
+
+
+def _rewrite_for_a_packaged_build(argv: Sequence[str] | None) -> Sequence[str] | None:
+    """Let the packaged executable be used the way an application is used.
+
+    Dropping a log onto the icon, or opening one with it from a file manager,
+    hands the program a bare path. Argparse would reject that as an unknown
+    subcommand -- and a windowed executable has nowhere to print the complaint,
+    so from the user's side the program would simply fail to start. A single
+    argument that is a file is what "open this" looks like, so it is read as one.
+
+    Only under a frozen build. From a shell, ``rotorid flight.bin`` should still
+    be told that the command is ``rotorid gui flight.bin``, because there the
+    error is visible and the correction sticks.
+    """
+    if not getattr(sys, "frozen", False):
+        return argv
+    values = list(sys.argv[1:] if argv is None else argv)
+    if len(values) == 1 and not values[0].startswith("-") and Path(values[0]).is_file():
+        return ["gui", values[0]]
+    return argv
+
+
+def _cmd_selftest(args: argparse.Namespace) -> int:
+    """Exercise every layer of this build and say which ones worked."""
+    from rotorid.selftest import run_selftest
+
+    result = run_selftest(args.log, gui=not args.no_gui)
+    text = result.to_json() if args.json else result.describe()
+    print(text)
+    if args.out is not None:
+        # Written as well as printed, because the packaged executable is windowed
+        # and has no stdout for anyone to read.
+        args.out.write_text(result.to_json(), encoding="utf-8")
+    return EXIT_OK if result.ok else EXIT_BLOCKED
 
 
 def _open_window_without_a_log() -> int | None:

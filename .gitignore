@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 dist/
 build/
+# PyInstaller writes this next to build.py. It is generated from build.py's own
+# argument list, so editing it by hand would be overwritten on the next build.
+*.spec
 *.egg-info/
 .cache/
 

@@ -15,6 +15,23 @@ loads deliberately, one stage at a time.
 
 ## Install
 
+### As an executable
+
+One file, no Python needed. Build it once for your platform:
+
+```bash
+python build.py --log path/to/some-flight.bin
+```
+
+That produces `dist/rotorid.exe` on Windows or `dist/rotorid` on Linux, then runs the
+finished binary's own self-check to confirm it can read a log and draw every stage —
+building a file and having one that works are different events, and on a one-file
+bundle they come apart in ways that only appear on a machine without Python. Details,
+including why the Linux binary has to be built on Linux, are in
+[`docs/building.md`](docs/building.md).
+
+### As a Python package
+
 Python 3.11 or newer.
 
 ```bash
@@ -26,7 +43,17 @@ python -m venv .venv
 ```
 
 On Linux and macOS the interpreter is at `.venv/bin/python` instead. Drop `gui` if you
-only want the command line; drop `dev` if you are not running the tests.
+only want the command line; drop `dev` if you are not running the tests; add `build`
+if you want to produce an executable.
+
+### Without installing anything
+
+The package needs no install of its own — put `src` on the path and run it from the
+checkout. The dependencies still have to exist somewhere.
+
+```bash
+PYTHONPATH=src python -m rotorid
+```
 
 ## Use it
 
@@ -83,6 +110,12 @@ rotorid analyze flight.bin --axes roll,pitch,yaw -o report.html --export ./param
 
 ```bash
 rotorid session flight.rotorid
+```
+
+**Check that this build works, and if not, which layer:**
+
+```bash
+rotorid selftest flight.bin
 ```
 
 Useful flags on `analyze`:
@@ -209,7 +242,7 @@ Early development. The full specification and milestone plan is in
 | M8 — staged `.param` export, session save/load, safety gates | done |
 | M9 — PX4 `.ulg` reader, filter chain and design | done against synthetic uLog bytes |
 | M10 — validation mode | in progress |
-| M11 — single-file executables | planned |
+| M11 — single-file executables | done; `build.py`, verified by the binary's own self-check |
 | General flight logs — unbiased estimator, vibration, step response | in progress |
 
 The pipeline runs end to end: log → segment → frequency response with the loop
