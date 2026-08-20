@@ -221,6 +221,14 @@ def compare_logs(
             "the gains, the filters and the parameter names are all different quantities"
         )
 
+    # Both refusals before any work: a comparison that spends two minutes on the
+    # spectra and then discovers it was never going to be valid has wasted the
+    # user's time to tell them something it knew at the first line.
+    if session is not None and session.log.stack != after.stack:
+        raise ValueError(
+            f"the saved session is for a {session.log.stack} vehicle and the logs are {after.stack}"
+        )
+
     notes: list[str] = []
     comparisons: dict[Axis, AxisComparison] = {}
     for axis in axes:
@@ -229,11 +237,6 @@ def compare_logs(
             notes.append(f"{axis}: not present in both logs, so it is not compared")
             continue
         comparisons[axis] = comparison
-
-    if session is not None and session.log.stack != after.stack:
-        raise ValueError(
-            f"the saved session is for a {session.log.stack} vehicle and the logs are {after.stack}"
-        )
 
     return ValidationReport(
         before=before,

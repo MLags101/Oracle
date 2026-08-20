@@ -191,7 +191,7 @@ def kind_evidence(bundle: LogBundle) -> tuple[str, ...]:
         if signal is not None and signal.y.size and bool(np.any(np.abs(signal.y) > 1e-6)):
             found.append(f"an injected SYSTEMID chirp on {axis} ({key})")
     gate = bundle.signals.get("mode.autotune")
-    if gate is not None and gate.y.size and bool(np.any(gate.y > 0.5)):
+    if gate is not None and gate.t.size > 1 and bool(np.any(gate.y > 0.5)):
         seconds = float(np.count_nonzero(gate.y > 0.5)) / max(gate.rate_hz, 1e-9)
         found.append(f"{seconds:.0f} s of the firmware's own autotune ({gate.source_msg})")
     return tuple(found)

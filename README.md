@@ -313,7 +313,13 @@ wrong stack, produces numbers that look entirely reasonable and are wrong.
 
 ## Status
 
-Early development. The full specification and milestone plan is in
+Every milestone in the plan is implemented. What is not closed is *evidence*:
+several of them are verified against synthetic logs whose ground truth is known
+exactly, and are still waiting on real flight data to confirm against. The table
+says which is which, because "implemented" and "shown to be right on a real
+aircraft" are different claims and this tool of all tools should not blur them.
+
+The full specification and milestone plan is in
 [`rotorid-implementation-plan.md`](rotorid-implementation-plan.md).
 
 | Milestone | State |
@@ -324,7 +330,7 @@ Early development. The full specification and milestone plan is in
 | M3 — noise, peak classification, notch recommendation | done against synthetic logs |
 | M4 — joint filter + gain optimizer | done; re-solve ~150 ms against the 300 ms budget |
 | M5 — guidance engine and staged flight plan | done |
-| M6/M7 — GUI shell, all eight stages, live sandbox | done |
+| M6/M7 — GUI shell, all nine stages, live sandbox | done |
 | M8 — staged `.param` export, session save/load, safety gates | done |
 | M9 — PX4 `.ulg` reader, filter chain and design, autotune ingest | done against synthetic uLog bytes |
 | M10 — validation mode | done; before/after screen, `rotorid validate`, HTML comparison |
@@ -339,9 +345,27 @@ sweep within 10% on `K`, `wn`, `zeta` and `tau`, classifies known motor harmonic
 a known frame resonance correctly, and reports margins that hold when the loop is
 rebuilt from the published parameters alone.
 
+Validation mode closes the loop on the synthetic side: gains recommended from one
+simulated flight, re-flown through the same simulated airframe, produce a measured
+step that matches the prediction. Nothing about that is true by construction — the
+prediction comes from a fitted model driven through the controller model and the
+measurement from a regularized deconvolution — so it holds only if the
+identification, the controller model and the step recovery are all right at once.
+
 Real ArduPilot logs read correctly and are refused for the right reason — the ones on
 hand were flown without ATTITUDE_FAST, so they carry `RATE` at 10 Hz. A log flown with
-that bit set is what the current work still needs to close against real data.
+that bit set is what the remaining work needs to close against real data:
+
+- the firmware-parity check on the filter engine (M2), which needs a log with
+  pre- *and* post-filter batch gyro in it;
+- a real before/after pair, to put the prediction against a real aircraft rather
+  than a simulated one;
+- a real PX4 autotune log, to confirm the ingest against bytes the vendor wrote
+  rather than bytes we wrote.
+
+Each of those is a test that exists and is waiting for its input, not a feature
+that is missing. `rotorid profile` writes the parameter file that produces the
+first one.
 
 ## Develop
 
