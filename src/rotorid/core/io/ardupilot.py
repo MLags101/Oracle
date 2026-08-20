@@ -60,6 +60,7 @@ _FALLBACK_UNITS: dict[tuple[str, str], str] = {
     ("BAT", "Volt"): "V",
     ("BAT", "Curr"): "A",
     ("ESC", "RPM"): "rev/min",
+    **{("VIBE", f): "m/s/s" for f in ("VibeX", "VibeY", "VibeZ")},
 }
 
 #: Declared-unit string to a multiplier that reaches canonical units.
@@ -72,6 +73,12 @@ _UNIT_SCALE: dict[str, float] = {
     "A": 1.0,
     "rpm": 1.0,
     "rev/min": 1.0,
+    # ArduPilot spells acceleration this way in FMTU; the canonical key spells it
+    # "m/s^2". Same quantity, so the scale is one -- but the string has to be here
+    # or the reader warns and refuses to convert.
+    "m/s/s": 1.0,
+    "m/s^2": 1.0,
+    "instance": 1.0,
     "": 1.0,
     "normalized": 1.0,
     "%": 0.01,
@@ -287,6 +294,18 @@ class ArduPilotReader(LogReader):
         elif kind == "BAT":
             self._add(raw, units_seen, "batt.voltage", t, msg, kind, "Volt")
             self._add(raw, units_seen, "batt.current", t, msg, kind, "Curr")
+        elif kind == "VIBE":
+            # Two log formats, handled without branching. Modern ArduPilot writes
+            # one VIBE record per IMU with an ``IMU`` instance field and a single
+            # ``Clip``; before 4.0 there was no instance field and the three clip
+            # counters were separate fields on one record. `_add` skips a field the
+            # message does not carry, so both shapes land in the same keys.
+            imu = int(getattr(msg, "IMU", 0))
+            for field, component in (("VibeX", "x"), ("VibeY", "y"), ("VibeZ", "z")):
+                self._add(raw, units_seen, f"imu.{imu}.vibe.{component}", t, msg, kind, field)
+            self._add(raw, units_seen, f"imu.{imu}.clip", t, msg, kind, "Clip")
+            for legacy in range(3):
+                self._add(raw, units_seen, f"imu.{legacy}.clip", t, msg, kind, f"Clip{legacy}")
         elif kind == "PM":
             value = getattr(msg, "Load", None)
             if value is not None:

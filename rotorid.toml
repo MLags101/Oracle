@@ -15,6 +15,14 @@
 bias_warn_db = 2.0    # direct vs unbiased disagreement above this -> ESTIMATOR_BIAS_LARGE
 bias_warn_deg = 10.0  # the same comparison in phase
 
+[vibration]
+# ArduPilot's vibration damping guide and the methodical tuning guide, read off
+# VIBE, which already reports a level rather than a raw signal. Below 15 m/s^2 is
+# a healthy frame; at 30 and above the accelerometers stop being usable and
+# position and altitude control degrade with them.
+warn_m_s2 = 15.0
+blocker_m_s2 = 30.0
+
 [coherence]
 threshold = 0.6              # project default; below this an FRF bin is not trusted
 min_valid_octaves = 1.0      # narrower than this around crossover -> COHERENCE_NARROW_BAND

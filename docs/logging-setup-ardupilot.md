@@ -55,9 +55,17 @@ is on the aircraft, and it is one parameter:
 
 ```
 LOG_BITMASK        bit 0  (ATTITUDE_FAST)   RATE and ATT at the loop rate
+                   bit 2  (IMU)             VIBE: vibration and accel clipping
                    bit 12 (PID)             the PID* messages
                    bit 18 (IMU_FAST)        worth adding while you are in there
 ```
+
+Bit 2 is worth setting even on a flight you are not tuning from. Vibration is the
+one condition that makes every other measurement meaningless rather than merely
+weaker: a frame shaking hard enough to move its own sensors produces a gyro trace
+of the shaking, and an identification fitted to that will look confident and
+describe nothing. Without `VIBE` in the log RotorID cannot rule that out, and says
+so as `VIBRATION_NOT_LOGGED` rather than assuming the frame was fine.
 
 To get **pre-filter** gyro as well — which is what lets RotorID verify its model of
 your filter chain against your own aircraft rather than against arithmetic:
@@ -111,3 +119,4 @@ it is not a weaker answer, it is a different aircraft.
 | Pre-filter gyro (`ISBH`/`ISBD`) | Verification that the modeled filter chain matches your aircraft's. |
 | ESC telemetry (`ESC.RPM`) | Per-motor notch tracking, and honest classification of which peaks track RPM. |
 | `PM` (CPU load) | The check on whether expensive notch options fit in your board's headroom. |
+| `VIBE` (`LOG_BITMASK` bit 2) | Any way to tell whether the gyro measured the aircraft or the frame. |

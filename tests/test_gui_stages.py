@@ -151,3 +151,61 @@ def test_a_plot_can_explain_itself(window) -> None:
         window.segment_stage._trace,
     ):
         assert len(card._explanation) > 200, "an explanation has to actually explain"
+
+
+# --------------------------------------------------------------------------- #
+# The vibration gate
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def shaking_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """The same window, from a log whose frame was shaking hard enough to matter."""
+    from dataclasses import replace
+
+    import numpy as np
+
+    from rotorid.core.io import ardupilot
+    from rotorid.core.io.base import canonical_signal
+    from rotorid.gui.main_window import MainWindow
+
+    path = tmp_path / "shaking.bin"
+    path.write_bytes(b"")
+    bundle = make_bundle(make_airframe(), make_chain(), with_motor_noise=True)
+    t = bundle.signals["rate.roll.measured"].t
+    signals = dict(bundle.signals)
+    signals["imu.0.vibe.z"] = canonical_signal(
+        "imu.0.vibe.z", t, np.full(t.shape, 45.0), source_msg="VIBE"
+    )
+    monkeypatch.setattr(
+        ardupilot, "read_ardupilot", lambda p, **kw: replace(bundle, signals=signals)
+    )
+
+    win = MainWindow(AppState())
+    qtbot.addWidget(win)
+    with qtbot.waitSignal(win.state.log_loaded, timeout=60_000):
+        win.state.load_log(path)
+    with qtbot.waitSignal(win.state.analysis_finished, timeout=180_000):
+        win.state.run_analysis(("roll",))
+    return win
+
+
+def test_health_admits_when_vibration_was_never_logged(window) -> None:
+    """Silence is not a clean bill of health, and the screen must not imply it is."""
+    stage = window.health_stage
+    stage.refresh()
+    assert not stage._gate.isHidden()
+    assert "cannot tell" in stage._gate.text()
+
+
+def test_a_shaking_frame_is_called_out_above_the_spectrum(shaking_window) -> None:
+    """The gate has to sit above the peak table, because it invalidates it."""
+    stage = shaking_window.health_stage
+    stage.refresh()
+    assert not stage._gate.isHidden()
+    assert "m/s^2" in stage._gate.text()
+    assert "mechanical" in stage._gate.text().lower()
+
+    layout = stage.layout()
+    order = [layout.itemAt(i).widget() for i in range(layout.count())]
+    assert order.index(stage._gate) < order.index(stage._peaks)

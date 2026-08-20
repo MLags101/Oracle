@@ -55,10 +55,18 @@ CANONICAL_KEYS: dict[str, str] = {
     "cpu.load": "normalized",
 }
 
-#: Keys that take an index, e.g. ``motor.3.rpm``.
+#: Keys that take an index, e.g. ``motor.3.rpm`` or ``imu.1.vibe.z``.
 _INDEXED_KEYS: dict[str, str] = {
     "motor.{n}.output": "normalized",
     "motor.{n}.rpm": "rev/min",
+    # Vibration is per-IMU rather than aggregated, because that is how both stacks
+    # report it and because which IMU is shaking is diagnostic: one noisy sensor is
+    # a mounting problem, three are an airframe problem.
+    "imu.{n}.vibe.x": "m/s^2",
+    "imu.{n}.vibe.y": "m/s^2",
+    "imu.{n}.vibe.z": "m/s^2",
+    # A running total, not a rate. Only its increase across a window means anything.
+    "imu.{n}.clip": "count",
 }
 
 
@@ -73,10 +81,13 @@ def signal_units(key: str) -> str:
     if key in CANONICAL_KEYS:
         return CANONICAL_KEYS[key]
     parts = key.split(".")
-    if len(parts) == 3 and parts[0] == "motor" and parts[1].isdigit():
-        template = f"motor.{{n}}.{parts[2]}"
+    for position, part in enumerate(parts):
+        if not part.isdigit():
+            continue
+        template = ".".join([*parts[:position], "{n}", *parts[position + 1 :]])
         if template in _INDEXED_KEYS:
             return _INDEXED_KEYS[template]
+        break
     raise KeyError(f"{key!r} is not a canonical signal key (spec 6.3)")
 
 

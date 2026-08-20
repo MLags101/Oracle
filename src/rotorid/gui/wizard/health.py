@@ -25,12 +25,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from rotorid.core.types import Axis, SpectralPeak
+from rotorid.core.types import Axis, Finding, SpectralPeak
 from rotorid.gui.state import AppState
 from rotorid.gui.widgets.prepost_spectrum import PrePostSpectrumPlot
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["HealthStage"]
+
+#: The findings that gate everything below them on this page, worst first. Read
+#: from the session rather than recomputed: a stage that re-ran the check could
+#: show a different verdict than the report, which is the one thing a health
+#: screen must never do.
+_GATING_CODES = ("ACCEL_CLIPPING", "VIBRATION_HIGH", "VIBRATION_LOW", "VIBRATION_NOT_LOGGED")
+
+_GATE_STYLE = {
+    "blocker": "background:#7a1f1f; color:#ffffff; padding:8px; border-radius:4px;",
+    "warning": "background:#7a5b1f; color:#ffffff; padding:8px; border-radius:4px;",
+    "good": "background:#1f5a2e; color:#ffffff; padding:8px; border-radius:4px;",
+    "info": "background:#33383f; color:#ffffff; padding:8px; border-radius:4px;",
+}
 
 _KINDS = {
     "motor_fundamental": (
@@ -67,6 +80,15 @@ class HealthStage(StageWidget):
         self._axis_row = QHBoxLayout()
         layout.addLayout(self._axis_row)
 
+        # Above the spectrum, deliberately. If the frame is shaking or the
+        # accelerometers are clipping, nothing further down this page is a
+        # measurement of the aircraft, and the layout should say so before the
+        # user starts reading peaks.
+        self._gate = QLabel()
+        self._gate.setWordWrap(True)
+        self._gate.setVisible(False)
+        layout.addWidget(self._gate)
+
         self._summary = QLabel(
             "Run the analysis to measure the noise. Until then this is what the log "
             "says about itself."
@@ -91,6 +113,7 @@ class HealthStage(StageWidget):
 
     def refresh(self) -> None:
         result = self.state.result
+        self._show_gate(result.session.findings if result is not None else ())
         if result is None or not result.session.noise:
             self._peaks.setRowCount(0)
             self._spectrum.show_spectra(None)
@@ -114,6 +137,18 @@ class HealthStage(StageWidget):
             f"Noise floor {noise.noise_floor_db:.0f} dB, {len(noise.peaks)} peak(s) above it. "
             f"Pre-filter spectrum: {self._source_words(noise.pre_filter_source)}"
         )
+
+    def _show_gate(self, findings: tuple[Finding, ...]) -> None:
+        """The vibration verdict, or nothing if the analysis has not run."""
+        by_code = {f.code: f for f in findings}
+        found = [by_code[code] for code in _GATING_CODES if code in by_code]
+        if not found:
+            self._gate.setVisible(False)
+            return
+        worst = found[0]
+        self._gate.setStyleSheet(_GATE_STYLE.get(worst.severity, ""))
+        self._gate.setText("\n\n".join(f"{f.title}\n{f.detail} {f.action}".strip() for f in found))
+        self._gate.setVisible(True)
 
     @staticmethod
     def _source_words(source: str) -> str:

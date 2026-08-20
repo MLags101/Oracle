@@ -33,6 +33,7 @@ import numpy as np
 
 from rotorid.config import Config
 from rotorid.core.analysis.sysid import check_filter_model
+from rotorid.core.analysis.vibration import VibrationSummary, vibration_summary
 from rotorid.core.design.recommend import AxisAnalysis
 from rotorid.core.types import AXES, Axis, Finding, LogBundle, TuneRecommendation
 
@@ -149,6 +150,170 @@ def check_excitation(context: GuidanceContext) -> list[Finding]:
             )
         )
     return out
+
+
+def _identification_windows(context: GuidanceContext) -> tuple[tuple[float, float], ...] | None:
+    """The stretches of flight the model was actually fitted to.
+
+    ``None`` when nothing was analysed, which means the whole log. A log that was
+    refused still deserves a vibration verdict -- quite often the vibration is why.
+    """
+    windows = tuple(
+        (segment.t_start, segment.t_end)
+        for axis in context.axes()
+        for segment in context.analyses[axis].segments
+    )
+    return windows or None
+
+
+def _vibration(context: GuidanceContext) -> VibrationSummary:
+    return vibration_summary(context.bundle, _identification_windows(context))
+
+
+def check_vibration(context: GuidanceContext) -> list[Finding]:
+    """Whether the frame was still enough for its own sensors to measure it."""
+    summary = _vibration(context)
+    if not summary.measured:
+        return [
+            Finding(
+                severity="info",
+                code="VIBRATION_NOT_LOGGED",
+                title="No vibration data in this log",
+                detail=(
+                    "The log carries no vibration message, so the tool cannot tell whether "
+                    "the gyro trace it identified from is the aircraft's motion or the "
+                    "frame's. That is an absence of evidence rather than a clean bill of "
+                    "health: high vibration is the most common reason an identification is "
+                    "confidently wrong."
+                ),
+                action=(
+                    "Enable the IMU log group (ArduPilot LOG_BITMASK bit 2, VIBE) and re-fly."
+                    if context.bundle.stack == "ardupilot"
+                    else "Raise SDLOG_PROFILE to include vehicle_imu_status and re-fly."
+                ),
+                doc_link=_doc(context),
+            )
+        ]
+
+    warn = context.config.float_("vibration", "warn_m_s2")
+    blocker = context.config.float_("vibration", "blocker_m_s2")
+    where = f"IMU {summary.worst_imu} on {summary.worst_component}"
+    evidence = {
+        "level_m_s2": summary.level_m_s2,
+        "peak_m_s2": summary.peak_m_s2,
+        "warn_m_s2": warn,
+        "blocker_m_s2": blocker,
+        "imu": float(summary.worst_imu),
+    }
+    # Stated whenever the flight had excursions well above what it sat at, so a
+    # log that is calm on average and violent in two places does not read as calm.
+    excursion = (
+        f" It reached {summary.peak_m_s2:.0f} m/s^2 briefly."
+        if summary.peak_m_s2 > 2.0 * max(summary.level_m_s2, 1.0)
+        else ""
+    )
+
+    # Two thresholds against two different statistics, and neither substitutes for
+    # the other. The blocker is set on the *sustained* level, because a frame that
+    # is unusable is unusable throughout and a single sample cannot establish that
+    # -- the counters arrive here splined, and a spline overshoots. The warning is
+    # set on either, because a flight that touched the limit twice is a flight
+    # with a mechanical problem that happened not to be excited the rest of the time.
+    if summary.level_m_s2 < warn and summary.peak_m_s2 < warn:
+        return [
+            Finding(
+                severity="good",
+                code="VIBRATION_LOW",
+                title=f"Vibration sits at {summary.level_m_s2:.1f} m/s^2",
+                detail=(
+                    f"The worst vibration over the identified windows was {where}, and it "
+                    f"stayed under the {warn:.0f} m/s^2 the tuning guide treats as the "
+                    f"limit throughout. The gyro trace the model was fitted to is the "
+                    f"aircraft's motion."
+                ),
+                action="Nothing to do.",
+                evidence=evidence,
+            )
+        ]
+
+    severe = summary.level_m_s2 >= blocker
+    brief = summary.level_m_s2 < warn
+    return [
+        Finding(
+            severity="blocker" if severe else "warning",
+            code="VIBRATION_HIGH",
+            title=(
+                f"Vibration reaches {summary.peak_m_s2:.0f} m/s^2 on {where}"
+                if brief
+                else f"Vibration sits at {summary.level_m_s2:.1f} m/s^2 on {where}"
+            ),
+            detail=(
+                f"Sustained vibration over the identified windows was "
+                f"{summary.level_m_s2:.1f} m/s^2, against {warn:.0f} for a healthy frame "
+                f"and {blocker:.0f} where the accelerometers stop being usable.{excursion} "
+                + (
+                    "At this level the gyro is measuring the frame's resonance as much as "
+                    "the aircraft's motion, so the identified model is not of the aircraft "
+                    "and no gain derived from it can be trusted."
+                    if severe
+                    else "The frame is calm for most of the flight, so whatever shakes it "
+                    "is not excited the whole time -- which makes it a mechanical fault "
+                    "waiting for the right manoeuvre rather than a flight that went badly."
+                    if brief
+                    else "The identification still stands, but part of what it fitted is "
+                    "frame motion rather than airframe response, and the noise it implies "
+                    "will push the filter design harder than a clean frame needs."
+                )
+                + " Vibration is a mechanical problem; no gain or filter fixes it."
+            ),
+            action=(
+                "Balance the propellers, check for damaged or bent props and loose motor "
+                "mounts, and check the flight controller's vibration isolation before "
+                "tuning anything. Re-fly and confirm the level has come down."
+            ),
+            evidence=evidence,
+            doc_link=_doc(context),
+        )
+    ]
+
+
+def check_clipping(context: GuidanceContext) -> list[Finding]:
+    """Whether an accelerometer saturated while the model was being measured.
+
+    Separate from :func:`check_vibration` and always a blocker, because clipping
+    is not a degree of badness. A clipped sample is not a poor measurement of the
+    aircraft; it is the absence of one, and averaging more of them does not bring
+    it back.
+    """
+    summary = _vibration(context)
+    if not summary.clip_measured or not summary.clipped:
+        return []
+    imus = ", ".join(str(i) for i in summary.clipping_imus)
+    return [
+        Finding(
+            severity="blocker",
+            code="ACCEL_CLIPPING",
+            title=f"Accelerometer clipping on IMU {imus}",
+            detail=(
+                f"The clip counters rose by {summary.clip_count} inside the windows the "
+                f"model was identified from, which means the accelerometer hit the end of "
+                f"its measurement range. Beyond that point the sensor reports its limit "
+                f"rather than the aircraft, and the estimator has no way to tell the "
+                f"difference -- so the identification is fitted partly to a flat line that "
+                f"the aircraft never flew."
+            ),
+            action=(
+                "Fix the vibration first: balance props, check motor mounts and the "
+                "controller's isolation. Clipping must read zero throughout before any "
+                "tune from this aircraft means anything."
+            ),
+            evidence={
+                "clip_count": float(summary.clip_count),
+                "level_m_s2": summary.level_m_s2,
+            },
+            doc_link=_doc(context),
+        )
+    ]
 
 
 def check_identification_band(context: GuidanceContext) -> list[Finding]:
@@ -812,6 +977,8 @@ def _ratio(new: float, old: float) -> float:
 #: findings are sorted by severity -- but keeping related checks adjacent makes
 #: the module readable.
 CHECKS: tuple[Check, ...] = (
+    check_vibration,
+    check_clipping,
     check_excitation,
     check_identification_band,
     check_log_rate,

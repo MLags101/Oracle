@@ -137,6 +137,7 @@ class PX4Reader(LogReader):
 
         raw.update(self._esc(datasets))
         raw.update(self._misc(datasets))
+        raw.update(self._clipping(log))
 
         if progress is not None:
             progress(0.7, "resampling")
@@ -221,6 +222,41 @@ class PX4Reader(LogReader):
                 np.asarray(values, dtype=np.float64),
                 "esc_status",
             )
+        return out
+
+    def _clipping(self, log: Any) -> dict[str, tuple[FloatArray, FloatArray, str]]:
+        """Accelerometer clipping counts, per IMU, from ``vehicle_imu_status``.
+
+        Read off ``log.data_list`` rather than the name-keyed ``datasets`` map,
+        because this topic is multi-instance and that map keeps only one of them.
+        Which IMU clipped is the whole diagnostic value: one clipping sensor is a
+        mounting fault, all of them is an airframe that is shaking itself apart.
+
+        PX4 counts clipping per axis; the three are summed, because the question a
+        finding asks is whether the accelerometer was saturated at all, and an
+        accelerometer saturated on any axis is not measuring the aircraft.
+
+        Vibration itself is deliberately not read here. PX4's
+        ``accel_vibration_metric`` is a filtered delta-velocity difference, which is
+        not the quantity ArduPilot's ``VIBE`` reports, so the published 15/30 m/s^2
+        thresholds do not transfer to it and there is no equivalent published
+        threshold to use instead. Ingesting the number without a threshold would
+        only let it be mistaken for the one that has one.
+        """
+        out: dict[str, tuple[FloatArray, FloatArray, str]] = {}
+        for dataset in log.data_list:
+            if str(dataset.name) != "vehicle_imu_status":
+                continue
+            axes = [dataset.data.get(f"accel_clipping[{i}]") for i in range(3)]
+            present = [a for a in axes if a is not None]
+            if not present:
+                continue
+            total = np.sum(
+                np.stack([np.asarray(a, dtype=np.float64) for a in present], axis=1), axis=1
+            )
+            t = np.asarray(dataset.data["timestamp"], dtype=np.float64) / 1.0e6
+            instance = int(getattr(dataset, "multi_id", 0))
+            out[f"imu.{instance}.clip"] = (t, np.asarray(total), "vehicle_imu_status")
         return out
 
     def _misc(self, datasets: dict[str, Any]) -> dict[str, tuple[FloatArray, FloatArray, str]]:
