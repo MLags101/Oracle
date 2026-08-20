@@ -13,8 +13,10 @@ wizard people learn to fight.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QHBoxLayout,
@@ -54,6 +56,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"RotorID {__version__}")
         self.setStyleSheet(self.palette_.stylesheet())
         self.resize(1280, 860)
+        # On the window rather than only on the Load page, so a log dropped while
+        # the user happens to be looking at some other stage still opens.
+        self.setAcceptDrops(True)
 
         self._stages: dict[str, StageWidget] = {}
         self._build_rail()
@@ -163,6 +168,18 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- #
     # Reactions
     # ----------------------------------------------------------------- #
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        self._select(0)
+        self.state.load_log(Path(urls[0].toLocalFile()))
+        event.acceptProposedAction()
 
     def _run(self) -> None:
         if self.state.bundle is None:

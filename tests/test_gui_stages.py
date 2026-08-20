@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel
 
 from rotorid.gui.state import STAGES, AppState
@@ -209,3 +210,62 @@ def test_a_shaking_frame_is_called_out_above_the_spectrum(shaking_window) -> Non
     layout = stage.layout()
     order = [layout.itemAt(i).widget() for i in range(layout.count())]
     assert order.index(stage._gate) < order.index(stage._peaks)
+
+
+# --------------------------------------------------------------------------- #
+# Starting with nothing
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def empty_window(qtbot):
+    """The window as it opens when nobody named a log on the command line."""
+    from rotorid.gui.main_window import MainWindow
+
+    win = MainWindow(AppState())
+    qtbot.addWidget(win)
+    return win
+
+
+def test_the_window_opens_without_a_log_and_offers_to_find_one(empty_window) -> None:
+    """The reason `rotorid` on its own is allowed to open a window at all."""
+    stage = empty_window.load_stage
+    assert empty_window.work.currentIndex() == 0
+    assert stage._choose.isEnabled()
+    assert stage._choose.isDefault(), "the one thing to do here should be the default action"
+    assert not stage._empty.isHidden(), "an empty page with a button reads as a broken page"
+    assert stage._signals.isHidden(), "there are no signals to list yet"
+
+
+def test_a_log_can_be_dropped_on_the_window_not_only_on_the_load_page(
+    empty_window, qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from PySide6.QtCore import QMimeData, QPoint, QUrl
+    from PySide6.QtGui import QDropEvent
+
+    from rotorid.core.io import ardupilot
+
+    path = tmp_path / "dropped.bin"
+    path.write_bytes(b"")
+    bundle = make_bundle(make_airframe(), make_chain())
+    monkeypatch.setattr(ardupilot, "read_ardupilot", lambda p, **kw: bundle)
+
+    empty_window.rail.setCurrentRow(len(STAGES) - 1)
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(path))])
+    event = QDropEvent(
+        QPoint(10, 10),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    # The handler directly rather than through Qt's drag machinery: what is being
+    # tested is that the window has one and that it does the right thing, not that
+    # Qt delivers events.
+    with qtbot.waitSignal(empty_window.state.log_loaded, timeout=60_000):
+        empty_window.dropEvent(event)
+
+    assert empty_window.state.bundle is bundle
+    # And it brings the user back to the page that describes what was just opened.
+    assert empty_window.work.currentIndex() == 0

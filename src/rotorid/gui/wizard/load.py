@@ -57,12 +57,19 @@ class LoadStage(StageWidget):
         heading.setObjectName("Heading")
         layout.addWidget(heading)
 
-        hint = QLabel("Drop an ArduPilot .bin here, or choose a file.")
+        hint = QLabel(
+            "Drop an ArduPilot <code>.bin</code> or PX4 <code>.ulg</code> anywhere on this "
+            "window, or choose one below. Nothing is read from the vehicle and nothing is "
+            "written to it -- RotorID only ever reads a file you hand it."
+        )
         hint.setObjectName("Muted")
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         row = QHBoxLayout()
         self._choose = QPushButton("Choose log...")
+        self._choose.setDefault(True)
+        self._choose.setAutoDefault(True)
         self._choose.clicked.connect(self.open_log_dialog)
         row.addWidget(self._choose)
         self._status = QLabel("No log loaded.")
@@ -80,9 +87,24 @@ class LoadStage(StageWidget):
         self._signals.setHeaderLabels(("Signal", "Present", "What it is for"))
         layout.addWidget(self._signals, 1)
 
+        # An empty screen with a button on it reads as a screen that is broken.
+        # Saying what the next seven stages will do with the file turns the wait
+        # into an explanation.
+        self._empty = QLabel(
+            "Once a log is open this page lists every signal the analysis wants and says "
+            "which of them the log actually carries, before any time is spent on it. "
+            "The stages down the left unlock in order: what the gyro is hearing, which "
+            "stretches of the flight are worth identifying from, the airframe recovered "
+            "from them, then the filters and gains designed together against it."
+        )
+        self._empty.setObjectName("Muted")
+        self._empty.setWordWrap(True)
+        layout.addWidget(self._empty)
+
         state.log_loaded.connect(self._on_loaded)
         state.log_failed.connect(self._on_failed)
         state.log_loading.connect(lambda path: self._status.setText(f"Reading {path}..."))
+        self.refresh()
 
     # ----------------------------------------------------------------- #
 
@@ -121,6 +143,9 @@ class LoadStage(StageWidget):
         while self._summary.rowCount():
             self._summary.removeRow(0)
         self._signals.clear()
+        self._empty.setVisible(bundle is None)
+        self._signals.setVisible(bundle is not None)
+        self._summary_card.setVisible(bundle is not None)
         if bundle is None:
             return
 

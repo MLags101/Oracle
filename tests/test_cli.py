@@ -230,3 +230,42 @@ def test_a_session_can_be_saved_and_reopened_without_the_log(
     out = capsys.readouterr().out
     assert "ROLL" in out
     assert "margins" in out
+
+
+def test_bare_rotorid_opens_the_window_rather_than_printing_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typing ``rotorid`` should give you the tool, not a list of ways to ask for it.
+
+    Loading a log is something the GUI does perfectly well on its own -- picker,
+    drag target, File menu -- so requiring the path on the command line only made
+    the graphical tool one that had to be started from a terminal.
+    """
+    opened: list[object] = []
+    monkeypatch.setattr(cli, "_open_window_without_a_log", lambda: opened.append(True) or 0)
+    monkeypatch.setattr(cli.sys, "argv", ["rotorid"])
+    assert cli.main() == cli.EXIT_OK
+    assert opened == [True]
+
+
+def test_a_headless_install_still_gets_the_help(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No GUI extra is a perfectly good install, and gets told what it can do."""
+    monkeypatch.setattr(cli, "_open_window_without_a_log", lambda: None)
+    monkeypatch.setattr(cli.sys, "argv", ["rotorid"])
+    assert cli.main() == cli.EXIT_OK
+    assert "usage:" in capsys.readouterr().out
+
+
+def test_arguments_passed_in_are_never_answered_with_a_window(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An explicit empty list is a caller asking what the arguments are."""
+
+    def _refuse() -> int:
+        raise AssertionError("main([]) must not open a window")
+
+    monkeypatch.setattr(cli, "_open_window_without_a_log", _refuse)
+    assert cli.main([]) == cli.EXIT_OK
+    assert "usage:" in capsys.readouterr().out

@@ -33,6 +33,14 @@ only want the command line; drop `dev` if you are not running the tests.
 ### The window
 
 ```bash
+rotorid
+```
+
+That is the whole invocation. The window opens with nothing loaded and the first
+screen asks for a log — a file picker, or drag one anywhere onto the window. You can
+still name the file up front if you prefer:
+
+```bash
 rotorid gui flight.bin
 ```
 
@@ -50,7 +58,8 @@ what was rejected on the way.
 
 ### The command line
 
-Everything the window can do, the CLI can do headlessly.
+Everything the window can do, the CLI can do headlessly. On an install without the
+`gui` extra, bare `rotorid` prints this list instead of opening a window.
 
 **What is in this log, and what is missing:**
 

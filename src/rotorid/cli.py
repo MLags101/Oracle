@@ -31,10 +31,26 @@ EXIT_UNREADABLE = 3
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the CLI. Returns the process exit code rather than calling ``sys.exit``."""
+    """Run the CLI. Returns the process exit code rather than calling ``sys.exit``.
+
+    With no arguments at all this opens the window rather than printing usage.
+    Loading a log is something the GUI does perfectly well on its own -- there is
+    a file picker, a drag target and a File menu on the first screen -- so
+    requiring the path on the command line only turned the graphical tool into
+    one that had to be started from a terminal. Printing help stays the fallback
+    for an install without the GUI extra.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
+        # ``argv is None`` means the arguments came from the process, so an empty
+        # one is a user who typed ``rotorid`` and wants the tool. An explicitly
+        # passed empty list is a caller asking what the arguments are, and gets
+        # told rather than having a window opened at it.
+        if argv is None and len(sys.argv) <= 1:
+            opened = _open_window_without_a_log()
+            if opened is not None:
+                return opened
         parser.print_help()
         return EXIT_OK
 
@@ -270,6 +286,20 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         )
         return EXIT_BLOCKED
     return EXIT_OK
+
+
+def _open_window_without_a_log() -> int | None:
+    """Open the window with nothing loaded, or ``None`` if there is no window.
+
+    ``None`` rather than an error: an install without the ``gui`` extra is a
+    perfectly good headless install, and the right thing to show someone who
+    typed ``rotorid`` there is the list of commands they do have.
+    """
+    try:
+        from rotorid.gui.app import run
+    except ImportError:  # pragma: no cover - depends on the install extras
+        return None
+    return run(None)
 
 
 def _cmd_gui(args: argparse.Namespace) -> int:
