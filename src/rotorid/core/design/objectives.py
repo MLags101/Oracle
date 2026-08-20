@@ -48,6 +48,15 @@ _KD_OVER_KP = np.geomspace(0.002, 0.10, 18)
 #: ``1/(2*pi*tau)``. Above it, no gain set has usable margins.
 _CROSSOVER_DELAY_FRACTION = 0.25
 
+#: How many candidate crossovers to try per gain shape. The design grid is far
+#: finer than this because the *margins* are read off it, but trying every one of
+#: its points as a crossover costs an n_crossovers x n_frequencies sensitivity
+#: evaluation per shape for a resolution no user could fly the difference of.
+#: Sixty-four log-spaced candidates put neighbouring crossovers a few percent
+#: apart across the whole usable range, which is finer than the difference a
+#: pilot could feel.
+_MAX_CROSSOVER_CANDIDATES = 64
+
 
 @dataclass(frozen=True, slots=True)
 class DesignTargets:
@@ -129,24 +138,29 @@ def _first_upward_crossing_rows(f: FloatArray, values: FloatArray, level: float)
     """Per-row lowest frequency where ``values`` rises through ``level``.
 
     ``values`` is ``(n_candidates, n_frequencies)``. Rows that never cross return
-    0.0, which reads downstream as "no disturbance-rejection bandwidth".
+    0.0, which reads downstream as "no disturbance-rejection bandwidth". Rows that
+    are already above the level in the first bin return the bottom of the band:
+    such a loop rejects nothing anywhere, however clean it looks higher up.
+
+    Written without a Python loop because the design calls it once per gain shape,
+    a few hundred times per re-solve, inside the interactive budget.
     """
     reached = values >= level
-    out = np.zeros(values.shape[0], dtype=np.float64)
     any_reached = reached.any(axis=1)
-    first = np.argmax(reached, axis=1)
+    right = np.argmax(reached, axis=1)
+    left = np.maximum(right - 1, 0)
+    rows = np.arange(values.shape[0])
 
-    for r in np.nonzero(any_reached)[0]:
-        c = int(first[r])
-        if c == 0:
-            # Already above the level at the bottom of the band: this loop has no
-            # disturbance-rejection bandwidth at all, however clean it looks higher up.
-            out[r] = f[0]
-            continue
-        y0, y1 = values[r, c - 1], values[r, c]
-        x0, x1 = np.log(f[c - 1]), np.log(f[c])
-        out[r] = np.exp(x0 + (level - y0) * (x1 - x0) / (y1 - y0)) if y1 != y0 else f[c]
-    return out
+    y0 = values[rows, left]
+    y1 = values[rows, right]
+    x0 = np.log(f[left])
+    x1 = np.log(f[right])
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        interpolated = np.exp(x0 + (level - y0) * (x1 - x0) / (y1 - y0))
+    out = np.where(y1 != y0, interpolated, f[right])
+    out = np.where(right == 0, f[0], out)
+    return np.asarray(np.where(any_reached, out, 0.0), dtype=np.float64)
 
 
 def design_gains(
@@ -190,6 +204,11 @@ def design_gains(
     )
 
     wc_choices = np.nonzero((f_grid > f_grid[0]) & (f_grid <= ceiling_hz))[0]
+    if wc_choices.size > _MAX_CROSSOVER_CANDIDATES:
+        # The grid is log-spaced, so evenly spaced indices are evenly spaced in
+        # log frequency -- which is how crossover resolution should be measured.
+        picks = np.linspace(0, wc_choices.size - 1, _MAX_CROSSOVER_CANDIDATES)
+        wc_choices = wc_choices[np.unique(np.round(picks).astype(int))]
     if wc_choices.size == 0:
         raise ValueError(
             f"crossover ceiling of {ceiling_hz:.2f} Hz sits below the design grid; "
@@ -213,13 +232,24 @@ def design_gains(
             # Gain margin, from the first phase crossing of -180 degrees.
             gm_db = _gain_margin_row(f_grid, mag1_db, phase_deg, kp_db)
 
-            L = kp[:, None] * L1[None, :]
+            # Phase and gain margin are one-dimensional and cheap. Sensitivity is
+            # not: it needs the whole loop at every candidate crossover, which is
+            # the single most expensive array in the design. So the cheap
+            # constraints are applied first and only the survivors pay for it.
+            passes_margins = (pm >= pm_target) & (gm_db >= targets.gm_min_db)
+            if not passes_margins.any():
+                ms_probe = np.full(pm.shape, -np.inf)
+                blockers.append(_worst_blocker(pm, gm_db, ms_probe, targets, pm_target))
+                continue
+
+            rows = np.nonzero(passes_margins)[0]
+            L = kp[rows, None] * L1[None, :]
             S_db = -20.0 * np.log10(np.abs(1.0 + L))
             ms_db = np.max(S_db, axis=1)
 
-            ok = (pm >= pm_target) & (gm_db >= targets.gm_min_db) & (ms_db <= targets.ms_max_db)
+            ok = ms_db <= targets.ms_max_db
             if not ok.any():
-                blockers.append(_worst_blocker(pm, gm_db, ms_db, targets, pm_target))
+                blockers.append(_worst_blocker(pm[rows], gm_db[rows], ms_db, targets, pm_target))
                 continue
 
             drb = _first_upward_crossing_rows(f_grid, S_db, _DRB_LEVEL_DB)
@@ -229,7 +259,7 @@ def design_gains(
             if drb[winner] <= 0.0:
                 continue
 
-            candidate_kp = float(kp[winner])
+            candidate_kp = float(kp[rows[winner]])
             gains = GainSet(
                 axis=axis,
                 kp=candidate_kp,

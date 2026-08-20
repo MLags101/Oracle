@@ -77,6 +77,14 @@ class Signal:
             chain. Both stacks log a post-filter gyro as the rate measurement, so
             this is ``True`` for ``rate.*.measured`` and ``False`` only for
             pre-filter batch data. ``None`` where the distinction does not apply.
+        native_rate_hz: The rate this signal was *logged* at, before resampling.
+            This is not the same number as :attr:`rate_hz` once the signal is on
+            the common grid, and the difference is the whole point: interpolation
+            moves samples onto a faster time base but creates no information, so
+            everything above the native Nyquist is spline opinion. A log with
+            ``LOG_BITMASK`` bit 0 clear puts ``RATE`` on the 10 Hz medium-rate
+            schedule while ``SCHED_LOOP_RATE`` still says 400, and nothing else in
+            the file admits it. ``None`` when the reader could not establish it.
     """
 
     name: str
@@ -85,6 +93,7 @@ class Signal:
     units: str
     source_msg: str
     filtered: bool | None = None
+    native_rate_hz: float | None = None
 
     @property
     def dt(self) -> float:
@@ -104,6 +113,17 @@ class Signal:
         if self.t.size == 0:
             return 0.0
         return float(self.t[-1] - self.t[0])
+
+    @property
+    def native_nyquist_hz(self) -> float | None:
+        """Highest frequency this signal can carry real information about.
+
+        Above it there is nothing to recover: the vehicle sampled the quantity
+        this slowly and no reconstruction adds back what was never written down.
+        """
+        if self.native_rate_hz is None:
+            return None
+        return 0.5 * self.native_rate_hz
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,7 +411,15 @@ class SpectralPeak:
 
 @dataclass(frozen=True, slots=True)
 class NoiseProfile:
-    """Gyro noise characterization for one axis."""
+    """Gyro noise characterization for one axis.
+
+    Attributes:
+        pre_filter_source: Where :attr:`psd_pre` came from. ``"measured"`` means
+            batch-logged pre-filter gyro; ``"reconstructed"`` means the flown chain
+            was divided out of the post-filter spectrum, which cannot see inside a
+            notch deeper than the deconvolution floor. Design code has to know
+            which, because "no peak here" means different things in the two cases.
+    """
 
     axis: Axis
     f_hz: FloatArray
@@ -399,6 +427,7 @@ class NoiseProfile:
     noise_floor_db: float
     peaks: tuple[SpectralPeak, ...] = ()
     psd_pre: FloatArray | None = None
+    pre_filter_source: Literal["measured", "reconstructed", "none"] = "none"
     psd_vs_throttle: FloatArray | None = None
     motor_fundamental_track: FloatArray | None = None
 
@@ -416,6 +445,10 @@ class FilterRecommendation:
         params: Stack-specific parameter names to values, ready for export.
         phase_cost_deg: Chain phase lag at the design crossover. The number the
             joint optimizer trades against attenuation.
+        psd_f_hz: Frequency axis shared by :attr:`psd_pre` and
+            :attr:`predicted_psd_post`. Carried here so the recommendation can be
+            plotted and argued with on its own, without the noise profile it came
+            from having to be kept alongside it.
         rejected: ``(alternative, why it lost)`` pairs, surfaced by the
             "Why this number?" affordance.
     """
@@ -427,6 +460,8 @@ class FilterRecommendation:
     phase_cost_deg: float
     cpu_cost_rel: float
     rationale: str
+    psd_f_hz: FloatArray | None = None
+    psd_pre: FloatArray | None = None
     predicted_psd_post: FloatArray | None = None
     attenuation_at_peaks_db: dict[float, float] = field(default_factory=dict)
     rejected: tuple[tuple[str, str], ...] = ()

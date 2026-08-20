@@ -38,8 +38,25 @@ summing their spectra, which is the standard method and measurably reduces varia
 
 ## 2. Set up logging
 
+### The one that decides whether the log is usable at all
+
+`SCHED_LOOP_RATE` is how fast the controller runs. `LOG_BITMASK` is how fast it
+writes down what it did, and those are two separate decisions. With **bit 0
+(ATTITUDE_FAST) clear**, `RATE` and `ATT` go to the card on the 10 Hz medium-rate
+schedule while the loop keeps running at 400 Hz, and nothing else in the file
+says so.
+
+A 10 Hz log carries no information above 5 Hz. RotorID will resample it onto its
+analysis grid, coherence will look excellent all the way up — both signals were
+smoothed by the same interpolator, so of course they agree — and the model that
+comes back will be a confident description of a cubic spline. RotorID checks the
+logged rate against the loop rate and refuses rather than doing that, but the fix
+is on the aircraft, and it is one parameter:
+
 ```
-LOG_BITMASK        include the PID bit (required for the PID* messages)
+LOG_BITMASK        bit 0  (ATTITUDE_FAST)   RATE and ATT at the loop rate
+                   bit 12 (PID)             the PID* messages
+                   bit 18 (IMU_FAST)        worth adding while you are in there
 ```
 
 To get **pre-filter** gyro as well — which is what lets RotorID verify its model of
@@ -80,10 +97,15 @@ That lists the signals found, the excitation segments detected, and anything
 missing. If it reports no excitation, the sweep did not make it into the log and
 nothing downstream is worth running.
 
+`rotorid analyze` reports the rate each message was actually logged at whenever
+it is too slow to design against, as `LOG_RATE_TOO_LOW`. That one is a blocker:
+it is not a weaker answer, it is a different aircraft.
+
 ## What each thing buys you
 
 | If this is missing | What you lose |
 |---|---|
+| `LOG_BITMASK` bit 0 (ATTITUDE_FAST) | Everything. `RATE` logs at 10 Hz and the log carries nothing above 5 Hz. |
 | SYSTEMID sweep | Everything. Ordinary flight gives a low-confidence estimate at best. |
 | `PID*` messages | Term-level diagnosis: slew limiting, D-term noise, integrator windup. |
 | Pre-filter gyro (`ISBH`/`ISBD`) | Verification that the modeled filter chain matches your aircraft's. |

@@ -20,8 +20,7 @@ cannot, and the tool has to justify every number it prints.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -29,12 +28,13 @@ from rotorid.config import Config
 from rotorid.core.analysis.noise import MotorTrack, dterm_noise_rms
 from rotorid.core.filters.chain import FilterChain, OperatingPoint
 from rotorid.core.filters.harmonic import HarmonicNotch, NotchOption
-from rotorid.core.types import FilterRecommendation, FloatArray, NoiseProfile, SpectralPeak
+from rotorid.core.types import FilterRecommendation, NoiseProfile, SpectralPeak, Stack
 
 __all__ = [
     "GYRO_LPF_LADDER",
     "NotchSource",
     "choose_notch_source",
+    "describe_chain",
     "recommend_filters",
 ]
 
@@ -91,6 +91,7 @@ def choose_notch_source(
     hover_thrust: float | None,
     fft_available: bool,
     fundamental_hz: float,
+    stack: Stack = "ardupilot",
 ) -> NotchSource:
     """Pick the tracking source, best available first.
 
@@ -111,6 +112,11 @@ def choose_notch_source(
             "no motor fundamental frequency was measured; a harmonic notch cannot "
             "be centred without one. Log ESC telemetry, or hover for 20-30 s so "
             "the fundamental can be read off the gyro spectrum."
+        )
+
+    if stack == "px4":
+        return _px4_notch_source(
+            track=track, fft_available=fft_available, fundamental_hz=fundamental_hz
         )
 
     rejected: list[tuple[str, str]] = []
@@ -174,15 +180,71 @@ def choose_notch_source(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _Candidate:
-    """One rung of the ladder, kept with the evidence for why it was chosen."""
+def _px4_notch_source(
+    *, track: MotorTrack, fft_available: bool, fundamental_hz: float
+) -> NotchSource:
+    """``IMU_GYRO_DNF_EN`` for PX4, whose choices are narrower than ArduPilot's.
 
-    notch: HarmonicNotch | None
-    gyro_lpf_hz: float
-    dterm_lpf_hz: float
-    notes: list[str] = field(default_factory=list)
-    rejected: list[tuple[str, str]] = field(default_factory=list)
+    PX4's dynamic notch has exactly two sources -- ESC RPM and the onboard FFT --
+    and **no throttle model**. So where ArduPilot degrades to throttle tracking
+    and finally to a static notch, PX4 simply cannot track at all without one of
+    those two. Saying so is the honest answer: a static ``IMU_GYRO_NF0`` pinned at
+    the frequency this log happened to hover at will be in the wrong place at
+    every other throttle setting, and dressing that up as a tracking notch would
+    be worse than admitting the aircraft is not instrumented for one.
+
+    ``freq_hz`` carries ``IMU_GYRO_DNF_MIN``: the lowest frequency the notch will
+    follow the motors down to.
+    """
+    minimum = round(fundamental_hz * _FREQ_MIN_RATIO, 1)
+    if track.source == "esc_telemetry":
+        return NotchSource(
+            mode=1,  # IMU_GYRO_DNF_EN bit 0
+            ref=0.0,
+            freq_hz=minimum,
+            rationale=(
+                f"ESC RPM telemetry is in the log, so the dynamic notch tracks "
+                f"measured motor speed (IMU_GYRO_DNF_EN bit 0). The fundamental at "
+                f"this operating point is {fundamental_hz:.0f} Hz, and tracking is "
+                f"allowed down to {minimum:.0f} Hz."
+            ),
+            rejected=(("onboard FFT (bit 1)", "measured RPM is available and is better"),),
+        )
+    if fft_available:
+        return NotchSource(
+            mode=2,  # IMU_GYRO_DNF_EN bit 1
+            ref=0.0,
+            freq_hz=minimum,
+            rationale=(
+                "No ESC RPM, but IMU_GYRO_FFT_EN is on, so the dynamic notch "
+                "tracks the measured noise peak (IMU_GYRO_DNF_EN bit 1). The FFT "
+                "lags fast throttle changes; ESC telemetry is better if the ESCs "
+                "can provide it."
+            ),
+            rejected=(("ESC RPM (bit 0)", "no ESC RPM in the log"),),
+        )
+    raise ValueError(
+        "PX4 has no throttle-derived notch tracking, and this log has neither ESC "
+        "RPM telemetry nor IMU_GYRO_FFT_EN. A dynamic notch cannot be recommended "
+        "from it. Enable ESC RPM telemetry, or set IMU_GYRO_FFT_EN = 1, and re-fly."
+    )
+
+
+def _reconstruction_is_blind(
+    noise: NoiseProfile,
+    baseline: FilterChain,
+    op: OperatingPoint,
+    config: Config,
+) -> bool:
+    """Whether the flown chain hides more than the deconvolution can undo.
+
+    Only meaningful when the profile was *reconstructed*. A log with genuine
+    pre-filter gyro sees straight through the notch and needs no such caution.
+    """
+    if not baseline.notches or noise.pre_filter_source != "reconstructed":
+        return False
+    floor = 10.0 ** (config.float_("filters", "deconv_floor_db") / 20.0)
+    return bool((np.abs(baseline.sensor_response(noise.f_hz, op)) < floor).any())
 
 
 def recommend_filters(
@@ -215,18 +277,19 @@ def recommend_filters(
         The recommendation, always including the current chain as its baseline.
 
     Raises:
-        NotImplementedError: for PX4, whose parameter surface lands with M9.
-        ValueError: if the profile has no pre-filter spectrum.
+        ValueError: if the profile has no pre-filter spectrum, or -- on PX4 -- if
+            the log has neither ESC RPM nor the onboard FFT, since PX4 has no
+            throttle-derived tracking to fall back on.
     """
-    if baseline.stack != "ardupilot":
-        raise NotImplementedError("PX4 filter recommendation lands with milestone M9")
+    stack = baseline.stack
     if noise.psd_pre is None:
         raise ValueError(
             "filter design needs a pre-filter spectrum; build the NoiseProfile with "
             "the flown chain so it can be divided out, or log pre-filter gyro"
         )
 
-    target_floor = config.float_("filters", "target_noise_floor_db")
+    target_excess = config.float_("filters", "peak_target_excess_db")
+    min_benefit = config.float_("filters", "harmonic_min_benefit_db")
     phase_budget = config.float_("filters", "phase_budget_deg")
     max_harmonics = config.int_("filters", "max_harmonics")
     ratio = config.float_(
@@ -237,19 +300,36 @@ def recommend_filters(
 
     tracked = [p for p in noise.peaks if p.tracks_rpm]
     structural = [p for p in noise.peaks if p.kind == "structural"]
-    fundamental = _fundamental_hz(tracked, track, noise)
+    fundamental = _fundamental_hz(tracked, track)
 
     rejected: list[tuple[str, str]] = []
     notes: list[str] = []
 
     notch: HarmonicNotch | None = None
     source: NotchSource | None = None
-    if tracked and fundamental > 0.0:
+    if not tracked and _reconstruction_is_blind(noise, baseline, op, config):
+        # The flown notch is deeper than the reconstruction can see through, so the
+        # absence of a peak inside it is not evidence that the peak is gone. The
+        # only safe move is to keep what is flying: removing a notch on the
+        # strength of the quiet it produced is how a vehicle ends up shaking.
+        # Left with source None, so no notch parameter is emitted at all: keeping
+        # what is flying means writing nothing, not re-writing the same values.
+        notch = baseline.notches[0]
+        notes.append(
+            f"The flown notch attenuates more than the "
+            f"{config.float_('filters', 'deconv_floor_db'):.0f} dB the pre-filter "
+            f"spectrum can be reconstructed through, so what it removed cannot be "
+            f"measured from this log. It is kept as flown. To have the tool design a "
+            f"notch from evidence rather than preserve one on faith, log pre-filter "
+            f"gyro (INS_LOG_BAT_OPT = 4)."
+        )
+    elif tracked and fundamental > 0.0:
         source = choose_notch_source(
             track=track,
             hover_thrust=hover_thrust,
             fft_available=fft_available,
             fundamental_hz=fundamental,
+            stack=stack,
         )
         rejected.extend(source.rejected)
         notch, notch_notes = _design_notch(
@@ -257,7 +337,8 @@ def recommend_filters(
             fundamental=fundamental,
             source=source,
             sample_rate_hz=baseline.sample_rate_hz,
-            target_floor_db=target_floor,
+            target_excess_db=target_excess,
+            min_benefit_db=min_benefit,
             max_harmonics=max_harmonics,
             ratio=ratio,
             att_bounds=att_bounds,
@@ -266,6 +347,7 @@ def recommend_filters(
             crossover_hz=crossover_hz,
             op=op,
             rejected=rejected,
+            stack=stack,
         )
         notes.extend(notch_notes)
     else:
@@ -278,15 +360,12 @@ def recommend_filters(
         )
 
     for peak in structural:
-        if peak.magnitude_db >= abs(target_floor) * 0.0 + config.float_(
-            "noise", "peak_prominence_db"
-        ):
-            notes.append(
-                f"Fixed-frequency peak at {peak.f_hz:.0f} Hz, {peak.magnitude_db:.0f} dB above "
-                f"the floor, does not track motor speed. That is a structural resonance -- "
-                f"a soft mount, a loose arm or a flexing frame. A tracking notch will not "
-                f"help it and a static notch only masks it; fix the mechanics."
-            )
+        notes.append(
+            f"Fixed-frequency peak at {peak.f_hz:.0f} Hz, {peak.magnitude_db:.0f} dB above the "
+            f"floor, does not track motor speed. That is a structural resonance -- a soft "
+            f"mount, a loose arm or a flexing frame. A tracking notch will not help it and a "
+            f"static notch only masks it; fix the mechanics."
+        )
 
     gyro_lpf, dterm_lpf, lpf_notes, lpf_rejected = _choose_lowpasses(
         noise,
@@ -302,7 +381,7 @@ def recommend_filters(
     rejected.extend(lpf_rejected)
 
     chain = FilterChain(
-        stack="ardupilot",
+        stack=stack,
         sample_rate_hz=baseline.sample_rate_hz,
         loop_rate_hz=baseline.loop_rate_hz,
         gyro_lpf_hz=gyro_lpf,
@@ -320,10 +399,10 @@ def recommend_filters(
     )
 
     return FilterRecommendation(
-        stack="ardupilot",
+        stack=stack,
         chain=chain,
         baseline_chain=baseline,
-        params=_ardupilot_params(chain, notch, source, noise.axis),
+        params=_params_for(stack, chain, notch, source, noise.axis),
         phase_cost_deg=phase_cost,
         cpu_cost_rel=chain.cpu_cost(op),
         rationale=" ".join(
@@ -335,6 +414,8 @@ def recommend_filters(
                 f"{phase_budget:.0f} deg budget.",
             ]
         ).strip(),
+        psd_f_hz=noise.f_hz,
+        psd_pre=noise.psd_pre,
         predicted_psd_post=predicted,
         attenuation_at_peaks_db=_attenuation_at_peaks(chain, noise.peaks, op),
         rejected=tuple(rejected),
@@ -346,19 +427,22 @@ def recommend_filters(
 # --------------------------------------------------------------------------- #
 
 
-def _fundamental_hz(
-    tracked: list[SpectralPeak], track: MotorTrack, noise: NoiseProfile
-) -> float:
-    """Motor fundamental, measured if possible and inferred from the peaks if not."""
-    if track.is_measured and track.mean_hz() > 0.0:
-        return track.mean_hz()
+def _fundamental_hz(tracked: list[SpectralPeak], track: MotorTrack) -> float:
+    """Where to centre the notch: the fundamental as the gyro itself saw it.
+
+    The peak frequency is preferred over the ESC's own number even when both are
+    available. They are measured at the same operating point, but the peak is
+    where the noise actually is -- which is what the notch has to sit on -- and it
+    absorbs any error in the RPM-to-frequency assumption along the way.
+    """
     firsts = [p.f_hz for p in tracked if p.harmonic_index == 1]
     if firsts:
         return float(min(firsts))
     if tracked:
-        # No harmonic labelling available: the lowest tracking peak is the best
-        # available guess at the fundamental.
+        # No harmonic labelling: the lowest tracking peak is the best guess left.
         return float(min(p.f_hz for p in tracked))
+    if track.is_measured:
+        return track.mean_hz()
     return 0.0
 
 
@@ -368,7 +452,8 @@ def _design_notch(
     fundamental: float,
     source: NotchSource,
     sample_rate_hz: float,
-    target_floor_db: float,
+    target_excess_db: float,
+    min_benefit_db: float,
     max_harmonics: int,
     ratio: float,
     att_bounds: tuple[float, float],
@@ -377,16 +462,33 @@ def _design_notch(
     crossover_hz: float,
     op: OperatingPoint,
     rejected: list[tuple[str, str]],
+    stack: Stack = "ardupilot",
 ) -> tuple[HarmonicNotch | None, list[str]]:
-    """Choose harmonics, bandwidth and attenuation, then back off to fit the budget."""
+    """Choose harmonics, bandwidth and attenuation, then back off to fit the budget.
+
+    On PX4 the attenuation step is skipped entirely rather than clamped: its notch
+    is a true null with no depth parameter, so bandwidth is the only shape
+    variable and there is nothing to trade depth against. Composite notches and
+    per-motor tracking do not exist there either.
+    """
     notes: list[str] = []
 
     # 1. Harmonics: only where a tracking peak actually sits.
     present: dict[int, SpectralPeak] = {}
     for peak in tracked:
-        index = peak.harmonic_index or int(round(peak.f_hz / fundamental))
-        if index >= 1 and index not in present:
-            present[index] = peak
+        index = peak.harmonic_index or round(peak.f_hz / fundamental)
+        if index < 1 or index in present:
+            continue
+        if peak.magnitude_db < target_excess_db + min_benefit_db:
+            rejected.append(
+                (
+                    f"harmonic {index} ({peak.f_hz:.0f} Hz)",
+                    f"only {peak.magnitude_db:.0f} dB above the floor, so a notch would buy "
+                    f"less than the {min_benefit_db:.0f} dB that justifies its phase cost",
+                )
+            )
+            continue
+        present[index] = peak
     harmonics = tuple(sorted(present)[:max_harmonics])
     if not harmonics:
         return None, notes
@@ -408,29 +510,39 @@ def _design_notch(
 
     # 3. Attenuation: the least that brings the worst peak to the target floor.
     worst_excess = max(present[h].magnitude_db for h in harmonics)
-    needed = worst_excess - abs(target_floor_db) + abs(target_floor_db)  # excess above floor
-    needed = worst_excess
-    attenuation = next(
-        (a for a in _ATT_LADDER if a >= needed and a >= att_bounds[0]),
-        att_bounds[1],
-    )
-    attenuation = float(np.clip(attenuation, *att_bounds))
-    if attenuation < needed:
+    if stack == "px4":
+        attenuation = 0.0
+        opts = 0
         notes.append(
-            f"The worst peak stands {worst_excess:.0f} dB above the floor, more than the "
-            f"{att_bounds[1]:.0f} dB attenuation cap. The notch takes it down as far as it "
-            f"can; the rest is a mechanical problem -- balance props and check mounts."
+            "PX4's notch is a full null with no attenuation setting, so bandwidth is "
+            "the only shape available. It removes the peak entirely at the centre; "
+            "how much of the surrounding noise goes with it, and how much phase that "
+            "costs, is the whole of the trade here."
         )
+    else:
+        needed = worst_excess - target_excess_db
+        attenuation = next(
+            (a for a in _ATT_LADDER if a >= needed and a >= att_bounds[0]),
+            att_bounds[1],
+        )
+        attenuation = float(np.clip(attenuation, *att_bounds))
+        if attenuation < needed:
+            notes.append(
+                f"The worst peak stands {worst_excess:.0f} dB above the floor, more than "
+                f"the {att_bounds[1]:.0f} dB attenuation cap. The notch takes it down as "
+                f"far as it can; the rest is a mechanical problem -- balance props and "
+                f"check mounts."
+            )
 
-    opts = NotchOption.TRIPLE_NOTCH if bandwidth > fundamental / 2.0 else 0
-    if opts:
-        notes.append(
-            "The peak is wide enough to need a composite notch, so OPTS bit 4 (triple) "
-            "is set rather than bit 0 (double): three narrow notches cover the same "
-            "width for less phase than two wide ones."
-        )
-    if per_motor:
-        opts |= NotchOption.MULTI_SOURCE
+        opts = NotchOption.TRIPLE_NOTCH if bandwidth > fundamental / 2.0 else 0
+        if opts:
+            notes.append(
+                "The peak is wide enough to need a composite notch, so OPTS bit 4 "
+                "(triple) is set rather than bit 0 (double): three narrow notches cover "
+                "the same width for less phase than two wide ones."
+            )
+        if per_motor:
+            opts |= NotchOption.MULTI_SOURCE
 
     # 4. Back off until the phase budget holds. Harmonics go first: the highest
     #    harmonic is the least valuable and, being furthest from the crossover, is
@@ -443,8 +555,9 @@ def _design_notch(
             attenuation_db=attenuation,
             harmonics=harmonics,
             sample_rate_hz=sample_rate_hz,
-            freq_min_ratio=_FREQ_MIN_RATIO if source.mode != 0 else 1.0,
+            freq_min_ratio=(1.0 if stack == "px4" or source.mode == 0 else _FREQ_MIN_RATIO),
             opts=opts,
+            flavor=stack,
         )
         phase = _notch_phase_deg(notch, crossover_hz, sample_rate_hz, op, fundamental)
         if phase <= phase_budget_deg:
@@ -581,7 +694,7 @@ def _choose_lowpasses(
 
 
 def _attenuation_at_peaks(
-    chain: FilterChain, peaks: tuple[SpectralPeak, ...], op: OperatingPoint
+    chain: FilterChain, peaks: tuple[SpectralPeak, ...], op: OperatingPoint | None
 ) -> dict[float, float]:
     """How much the candidate chain removes at each measured peak, in dB."""
     if not peaks:
@@ -594,6 +707,47 @@ def _attenuation_at_peaks(
 
 
 _AXIS_PARAM: dict[str, str] = {"roll": "RLL", "pitch": "PIT", "yaw": "YAW"}
+
+
+def _params_for(
+    stack: Stack,
+    chain: FilterChain,
+    notch: HarmonicNotch | None,
+    source: NotchSource | None,
+    axis: str,
+) -> dict[str, float]:
+    """The parameter set to write, in whichever firmware's names."""
+    if stack == "px4":
+        return _px4_params(chain, notch, source)
+    return _ardupilot_params(chain, notch, source, axis)
+
+
+def _px4_params(
+    chain: FilterChain, notch: HarmonicNotch | None, source: NotchSource | None
+) -> dict[str, float]:
+    """PX4's filter parameters.
+
+    ``IMU_DGYRO_CUTOFF`` is not a per-axis parameter on PX4 -- there is one gyro
+    filter set for the whole vehicle -- so a design that wanted different D-term
+    filtering on roll and on yaw simply cannot have it here, and the value that
+    gets written is the one the axis being designed asked for.
+    """
+    params: dict[str, float] = {}
+    if chain.gyro_lpf_hz:
+        params["IMU_GYRO_CUTOFF"] = float(chain.gyro_lpf_hz)
+    if chain.dterm_lpf_hz:
+        params["IMU_DGYRO_CUTOFF"] = float(chain.dterm_lpf_hz)
+    if notch is not None and source is not None:
+        params.update(
+            {
+                # source.mode carries the IMU_GYRO_DNF_EN bit, not a mode number.
+                "IMU_GYRO_DNF_EN": float(source.mode),
+                "IMU_GYRO_DNF_MIN": float(notch.freq_hz),
+                "IMU_GYRO_DNF_BW": float(notch.bandwidth_hz),
+                "IMU_GYRO_DNF_HMC": float(max(notch.harmonics)),
+            }
+        )
+    return params
 
 
 def _ardupilot_params(
@@ -625,4 +779,69 @@ def _ardupilot_params(
     return params
 
 
-PeakKind = Literal["motor_fundamental", "motor_harmonic", "structural", "broadband", "unknown"]
+def describe_chain(
+    chain: FilterChain,
+    baseline: FilterChain,
+    *,
+    axis: str,
+    stack: Stack,
+    noise: NoiseProfile | None,
+    op: OperatingPoint | None,
+    crossover_hz: float,
+    source: NotchSource | None = None,
+    rationale: str = "",
+) -> FilterRecommendation:
+    """Present an arbitrary chain the way a designed one is presented.
+
+    This is what makes the Filters sandbox honest. When the user overrides the
+    recommendation, the chain they built has to be measured by exactly the same
+    yardsticks -- phase at crossover, CPU cost, predicted spectrum, attenuation
+    at each measured peak -- or the comparison they are making is between a
+    number and a different number's name.
+
+    A chain identical to the flown one comes back as
+    :func:`~rotorid.core.design.joint.unchanged_filters`, so "the user rebuilt
+    what they already have" and "nothing was recommended" reach the rest of the
+    tool as the same thing, and neither writes a parameter.
+    """
+    from rotorid.core.design.joint import unchanged_filters
+
+    if chain.describe() == baseline.describe():
+        return unchanged_filters(
+            baseline,
+            stack,
+            rationale or "This chain is the one already flying.",
+            noise=noise,
+            op=op,
+        )
+
+    notch = chain.notches[0] if chain.notches else None
+    phase_cost = float(chain.phase_deg(np.array([crossover_hz]), op)[0])
+    spectrum: dict[str, object] = {}
+    if noise is not None and noise.psd_pre is not None:
+        spectrum = {
+            "psd_f_hz": noise.f_hz,
+            "psd_pre": noise.psd_pre,
+            "predicted_psd_post": np.asarray(
+                noise.psd_pre * np.abs(chain.sensor_response(noise.f_hz, op)) ** 2,
+                dtype=np.float64,
+            ),
+        }
+
+    return FilterRecommendation(
+        stack=stack,
+        chain=chain,
+        baseline_chain=baseline,
+        params=_params_for(stack, chain, notch, source, axis),
+        phase_cost_deg=phase_cost,
+        cpu_cost_rel=chain.cpu_cost(op),
+        rationale=rationale
+        or (
+            f"Chosen by hand. Costs {phase_cost:.1f} deg of phase at the "
+            f"{crossover_hz:.2f} Hz crossover."
+        ),
+        attenuation_at_peaks_db=(
+            _attenuation_at_peaks(chain, noise.peaks, op) if noise is not None else {}
+        ),
+        **spectrum,  # type: ignore[arg-type]
+    )

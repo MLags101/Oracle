@@ -25,7 +25,12 @@ from typing import Final, Literal
 
 import numpy as np
 
-from rotorid.core.filters.biquad import BiquadCoeffs, notch_A_Q, notch_biquad
+from rotorid.core.filters.biquad import (
+    BiquadCoeffs,
+    notch_A_Q,
+    notch_biquad,
+    px4_notch_A_Q,
+)
 
 __all__ = [
     "HARMONIC_NYQUIST_CUTOFF",
@@ -107,10 +112,18 @@ class HarmonicNotch:
     sample_rate_hz: float
     freq_min_ratio: float = 1.0
     opts: int = 0
+    flavor: Literal["ardupilot", "px4"] = "ardupilot"
 
     @property
     def composite_notches(self) -> int:
-        """Sub-notches per harmonic: 1, 2 (double) or 3 (triple)."""
+        """Sub-notches per harmonic: 1, 2 (double) or 3 (triple).
+
+        Always 1 on PX4, which has no composite-notch option at all. Reading
+        ArduPilot's ``OPTS`` bits into a PX4 chain would silently triple the
+        phase cost of every notch.
+        """
+        if self.flavor == "px4":
+            return 1
         return composite_count(self.opts)
 
     @property
@@ -120,7 +133,14 @@ class HarmonicNotch:
 
     @property
     def treat_low_as_min(self) -> bool:
-        """Whether low frequencies clamp to the minimum instead of fading out."""
+        """Whether low frequencies clamp to the minimum instead of fading out.
+
+        Always true on PX4: ``IMU_GYRO_DNF_MIN`` is a floor the tracked frequency
+        stops at, not the start of a fade-out. ArduPilot's fade is a deliberate
+        behaviour of its own and would be wrong to model here.
+        """
+        if self.flavor == "px4":
+            return True
         return bool(self.opts & NotchOption.TREAT_LOW_AS_MIN)
 
     @property
@@ -134,6 +154,13 @@ class HarmonicNotch:
         ``A`` and ``Q`` come from the *constrained* fundamental and from
         ``bandwidth / composite_notches``, once, for the whole stack.
         """
+        if self.flavor == "px4":
+            # No composite notches, no bandwidth constraint on the fundamental,
+            # and no attenuation setting: PX4's notch is a true null shaped by
+            # bandwidth alone.
+            A, Q = px4_notch_A_Q(self.freq_hz, self.bandwidth_hz)
+            return A, Q, 0.0
+
         nyquist_limit = self.sample_rate_hz * HARMONIC_NYQUIST_CUTOFF
         bandwidth_limit = self.bandwidth_hz * _BANDWIDTH_LIMIT_FACTOR
         center = float(np.clip(self.freq_hz, bandwidth_limit, nyquist_limit))

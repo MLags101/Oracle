@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.interpolate import CubicSpline
 
+from rotorid.core.io.base import native_rate_hz
 from rotorid.core.types import FloatArray, Signal
 
 __all__ = ["JitterStats", "grid_rate_hz", "measure_jitter", "resample_to_grid", "uniform_grid"]
@@ -136,6 +137,9 @@ def resample_to_grid(signal: Signal, grid: FloatArray) -> Signal:
     y[grid < t_unique[0]] = y_unique[0]
     y[grid > t_unique[-1]] = y_unique[-1]
 
+    # Carried, never recomputed: on the grid every signal reports the grid rate,
+    # and the one number that says how much of it is real is the rate it arrived
+    # at. Losing it here is how a 10 Hz message comes to look like an 800 Hz one.
     return Signal(
         name=signal.name,
         t=grid,
@@ -143,4 +147,7 @@ def resample_to_grid(signal: Signal, grid: FloatArray) -> Signal:
         units=signal.units,
         source_msg=signal.source_msg,
         filtered=signal.filtered,
+        native_rate_hz=(
+            signal.native_rate_hz if signal.native_rate_hz is not None else native_rate_hz(t_unique)
+        ),
     )

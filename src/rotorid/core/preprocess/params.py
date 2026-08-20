@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from rotorid.core.filters.chain import FilterChain, OperatingPoint, ardupilot_chain
+from rotorid.core.filters.chain import (
+    FilterChain,
+    OperatingPoint,
+    ardupilot_chain,
+    px4_chain,
+)
 from rotorid.core.types import Axis, GainSet, LogBundle
 
 __all__ = [
@@ -91,21 +96,14 @@ def gains_from_bundle(bundle: LogBundle, axis: Axis) -> GainSet:
 
 
 def chain_from_bundle(bundle: LogBundle, axis: Axis) -> FilterChain:
-    """Reconstruct the filter chain the log was recorded through.
-
-    Raises:
-        NotImplementedError: for PX4, which arrives with milestone M9. Failing
-            loudly here is deliberate: a PX4 log silently analysed with an
-            ArduPilot chain would produce numbers that look entirely reasonable.
-    """
-    if bundle.stack == "ardupilot":
-        return ardupilot_chain(
-            bundle.params,
-            axis,
-            gyro_sample_rate_hz=bundle.gyro_sample_rate_hz,
-            loop_rate_hz=bundle.loop_rate_hz,
-        )
-    raise NotImplementedError("PX4 filter-chain reconstruction lands with milestone M9")
+    """Reconstruct the filter chain the log was recorded through."""
+    builder = ardupilot_chain if bundle.stack == "ardupilot" else px4_chain
+    return builder(
+        bundle.params,
+        axis,
+        gyro_sample_rate_hz=bundle.gyro_sample_rate_hz,
+        loop_rate_hz=bundle.loop_rate_hz,
+    )
 
 
 def hover_operating_point(bundle: LogBundle, t_start: float, t_end: float) -> OperatingPoint:

@@ -166,11 +166,40 @@ def test_conservatism_reaches_the_recommendation() -> None:
     assert slow.conservatism == 1.0
 
 
-def test_filters_are_reported_as_deliberately_unchanged() -> None:
-    """M1 designs gains only. The output must say so rather than imply otherwise."""
+def test_filters_and_gains_come_out_as_one_package() -> None:
+    """A recommendation is never gains alone, and never filters alone.
+
+    On a real vehicle the filter configuration is usually what limits the
+    achievable bandwidth, so a recommendation that changed gains against a chain
+    it had not examined would be answering the easier half of the question.
+    """
     rec = analyze_axis(_bundle(), "roll", CONFIG)
-    assert rec.filters.chain is rec.filters.baseline_chain
-    assert "Filters left as flown" in rec.filters.rationale
+
+    assert rec.filters.baseline_chain.gyro_lpf_hz == 60.0, "the flown chain is carried through"
+    assert rec.filters.rationale
+    assert np.isfinite(rec.dterm_noise_rms_pct), (
+        "the D-term noise the design produces must be a measured number, not a hope"
+    )
+    if rec.filters.chain is not rec.filters.baseline_chain:
+        assert rec.filters.params, "a proposed change must come with parameters to write"
+
+
+def test_a_notch_is_not_removed_on_the_strength_of_the_quiet_it_produced() -> None:
+    """The most dangerous filter recommendation the tool could make.
+
+    A working notch hides its own peak. Reconstructing the pre-filter spectrum
+    recovers it only down to the deconvolution floor -- past that, the log simply
+    does not say what was there. Concluding "no peak, so no notch needed" from
+    that silence would hand the user a vehicle that shakes itself apart.
+    """
+    chain = make_chain(notch_freq_hz=90.0, notch_att_db=40.0, harmonics=(1, 2))
+    rec = analyze_axis(_bundle(chain=chain), "roll", CONFIG)
+
+    assert rec.filters.chain.notches, "the flown notch must survive"
+    assert "INS_HNTCH_ENABLE" not in rec.filters.params, (
+        "keeping a notch means writing nothing, not rewriting the same values"
+    )
+    assert "kept as flown" in rec.filters.rationale
 
 
 # --------------------------------------------------------------------------- #
@@ -206,3 +235,45 @@ def test_report_shows_the_phase_budget() -> None:
     svg = _budget_figure(rec)
     assert "<svg" in svg
     assert "airframe delay" in svg
+
+
+def test_a_continuous_sweep_is_found_even_though_its_envelope_is_flat() -> None:
+    """The fallback detector has to see the best excitation, not only the worst.
+
+    A deliberate slow-to-fast sweep -- the thing worth identifying from -- has a
+    nearly constant envelope, so a rule that looks for energy several times an
+    axis's own median finds bursts of stick input and misses the sweep entirely.
+    """
+    from rotorid.core.preprocess.segment import propose_segments
+    from tests.synthetic.generators import make_airframe, make_bundle, make_chain
+
+    bundle = make_bundle(make_airframe(), make_chain(), stack="px4", path="flight.ulg")
+    assert "excite.roll" not in bundle.signals, "this fixture has no injected-signal message"
+
+    segments = [s for s in propose_segments(bundle) if s.axis == "roll"]
+    assert segments, "the sweep was not found"
+    assert segments[0].kind == "pilot_input"
+    assert segments[0].confidence < 1.0, "found by energy, and it has to say so"
+    assert segments[0].duration_s > 30.0
+
+
+def test_a_still_flight_produces_no_segments_at_all() -> None:
+    """The other half of the same rule: absence of excitation is a real answer."""
+    import numpy as np
+
+    from rotorid.core.io.base import canonical_signal
+    from rotorid.core.preprocess.segment import propose_segments
+    from tests.synthetic.generators import make_airframe, make_bundle, make_chain
+
+    bundle = make_bundle(make_airframe(), make_chain(), stack="px4", path="flight.ulg")
+    still = {
+        key: (
+            canonical_signal(key, sig.t, np.zeros_like(sig.y), source_msg=sig.source_msg)
+            if key.endswith(".output")
+            else sig
+        )
+        for key, sig in bundle.signals.items()
+    }
+    from dataclasses import replace
+
+    assert propose_segments(replace(bundle, signals=still)) == ()

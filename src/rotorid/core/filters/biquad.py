@@ -32,6 +32,8 @@ __all__ = [
     "onepole_alpha",
     "onepole_response",
     "phase_lag_deg",
+    "px4_lpf2p_biquad",
+    "px4_notch_A_Q",
 ]
 
 FloatArray = NDArray[np.float64]
@@ -111,6 +113,59 @@ def notch_A_Q(center_hz: float, bandwidth_hz: float, attenuation_db: float) -> t
     two_oct = 2.0**octaves
     Q = float(np.sqrt(two_oct) / (two_oct - 1.0))
     return A, Q
+
+
+def px4_notch_A_Q(center_hz: float, bandwidth_hz: float) -> tuple[float, float]:
+    """Attenuation factor and quality factor for a PX4 notch.
+
+    Transcribed from ``mathlib/math/filter/NotchFilter.hpp``::
+
+        Q     = notch_freq / bandwidth
+        alpha = sin(2*pi*f0/fs) / (2*Q)
+
+    Two differences from ArduPilot matter and are the reason this is a separate
+    function rather than a parameter:
+
+    * PX4 has **no attenuation setting**. Its notch is a true null -- ``A = 0`` --
+      so depth is not a design variable there; bandwidth alone sets the shape.
+    * ``Q`` is the plain ``f0/BW`` ratio rather than ArduPilot's octave-based
+      expression, which gives a measurably different skirt for the same numbers.
+
+    Returns:
+        ``(A, Q)`` in the same shape :func:`notch_biquad` consumes. ``Q == 0.0``
+        means "disabled", matching the ArduPilot path.
+    """
+    if center_hz <= 0.0 or bandwidth_hz <= 0.0:
+        return 0.0, 0.0
+    return 0.0, float(center_hz / bandwidth_hz)
+
+
+def px4_lpf2p_biquad(cutoff_hz: float, sample_rate_hz: float) -> BiquadCoeffs:
+    """PX4 2-pole low-pass (``IMU_GYRO_CUTOFF``, ``IMU_DGYRO_CUTOFF``).
+
+    Transcribed from ``mathlib/math/filter/LowPassFilter2p.hpp``. It is the same
+    Butterworth design ArduPilot uses, written differently::
+
+        fr  = fs / cutoff
+        ohm = tan(pi / fr)
+        c   = 1 + 2*cos(pi/4)*ohm + ohm^2
+
+    PX4 disables the filter when the cutoff is at or above the Nyquist rate, and
+    unlike ArduPilot it applies no 0.4*fs clamp -- so a badly chosen
+    ``IMU_GYRO_CUTOFF`` behaves differently on the two stacks, and this function
+    has to behave differently with it.
+    """
+    if cutoff_hz <= 0.0 or cutoff_hz >= 0.5 * sample_rate_hz:
+        return BiquadCoeffs((1.0, 0.0, 0.0), (1.0, 0.0, 0.0), sample_rate_hz)
+    ohm = float(np.tan(np.pi * cutoff_hz / sample_rate_hz))
+    ohm2 = ohm * ohm
+    c = 1.0 + 2.0 * _COS_PI_4 * ohm + ohm2
+    b0 = ohm2 / c
+    return BiquadCoeffs(
+        b=(b0, 2.0 * b0, b0),
+        a=(1.0, 2.0 * (ohm2 - 1.0) / c, (1.0 - 2.0 * _COS_PI_4 * ohm + ohm2) / c),
+        sample_rate_hz=sample_rate_hz,
+    )
 
 
 def notch_biquad(center_hz: float, A: float, Q: float, sample_rate_hz: float) -> BiquadCoeffs:

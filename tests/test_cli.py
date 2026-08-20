@@ -37,11 +37,11 @@ def test_missing_file_exits_unreadable(capsys: pytest.CaptureFixture[str]) -> No
     assert "does not exist" in capsys.readouterr().err
 
 
-def test_unsupported_format_says_which_milestone(tmp_path: Path) -> None:
-    """A PX4 log must be refused clearly, not read as ArduPilot."""
-    ulg = tmp_path / "flight.ulg"
-    ulg.write_bytes(b"")
-    assert cli.main(["inspect", str(ulg)]) == cli.EXIT_BLOCKED
+def test_an_unknown_extension_is_refused_rather_than_guessed_at(tmp_path: Path) -> None:
+    """Which reader runs decides which parameter names the analysis speaks."""
+    other = tmp_path / "flight.txt"
+    other.write_bytes(b"")
+    assert cli.main(["inspect", str(other)]) == cli.EXIT_BLOCKED
 
 
 def test_inspect_lists_signals_and_excitation(
@@ -78,6 +78,16 @@ def test_analyze_reports_the_axis_it_could_do_and_explains_the_rest(
     assert "pitch: not analysed" in out
 
 
+def test_analyze_prints_the_filter_decision_next_to_the_gains(
+    synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Gains and filters are one recommendation, so they print as one block."""
+    assert cli.main(["analyze", str(synthetic_log), "--axes", "roll"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "filters" in out
+    assert "D-term output" in out
+
+
 def test_analyze_writes_a_report(synthetic_log: Path, tmp_path: Path) -> None:
     report = tmp_path / "out.html"
     assert cli.main(["analyze", str(synthetic_log), "--axes", "roll", "-o", str(report)]) == (
@@ -110,3 +120,113 @@ def test_no_analysable_axis_exits_blocked(monkeypatch: pytest.MonkeyPatch, tmp_p
     bundle = make_bundle(make_airframe(), make_chain(), axis="roll")
     monkeypatch.setattr(cli, "_read", lambda p: bundle)
     assert cli.main(["analyze", str(path), "--axes", "yaw"]) == cli.EXIT_BLOCKED
+
+
+def test_analyze_prints_findings_with_their_actions(
+    synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["analyze", str(synthetic_log), "--axes", "roll"]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "findings" in out
+    assert "NO_RAW_IMU_DATA" in out
+
+
+def test_a_blocking_finding_stops_the_run_until_it_is_acknowledged(
+    monkeypatch: pytest.MonkeyPatch, synthetic_log: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The safety gate: acting on a blocked analysis has to be a deliberate act."""
+    from rotorid.core.types import Finding
+
+    blocker = Finding(
+        severity="blocker",
+        code="LOW_CONFIDENCE_MODEL",
+        title="weak identification",
+        detail="d",
+        action="fly a sweep",
+    )
+    # The pipeline binds this name at import, so the pipeline module is where the
+    # command actually looks it up.
+    from rotorid.core import pipeline
+
+    monkeypatch.setattr(pipeline, "collect_findings", lambda context: (blocker,))
+
+    assert cli.main(["analyze", str(synthetic_log), "--axes", "roll"]) == cli.EXIT_BLOCKED
+    assert "LOW_CONFIDENCE_MODEL" in capsys.readouterr().err
+
+    assert (
+        cli.main(
+            [
+                "analyze",
+                str(synthetic_log),
+                "--axes",
+                "roll",
+                "--acknowledge",
+                "LOW_CONFIDENCE_MODEL",
+            ]
+        )
+        == cli.EXIT_OK
+    )
+
+
+def test_the_report_carries_the_findings_and_the_flight_plan(
+    synthetic_log: Path, tmp_path: Path
+) -> None:
+    report = tmp_path / "out.html"
+    assert cli.main(["analyze", str(synthetic_log), "--axes", "roll", "-o", str(report)]) == (
+        cli.EXIT_OK
+    )
+    text = report.read_text(encoding="utf-8")
+    assert "What the tool noticed" in text
+    assert "Next flights" in text
+    assert "Back up your parameters" in text
+
+
+def test_export_writes_staged_param_files(synthetic_log: Path, tmp_path: Path) -> None:
+    out = tmp_path / "params"
+    assert (
+        cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--export", str(out)])
+        == cli.EXIT_OK
+    )
+
+    files = sorted(out.glob("*.param"))
+    assert files
+    assert all("BACK UP YOUR CURRENT PARAMETERS" in f.read_text(encoding="utf-8") for f in files)
+
+
+def test_export_is_skipped_while_a_blocker_stands(
+    monkeypatch: pytest.MonkeyPatch, synthetic_log: Path, tmp_path: Path
+) -> None:
+    """Blocked means blocked: no files, not files with a warning in them."""
+    from rotorid.core import pipeline
+    from rotorid.core.types import Finding
+
+    blocker = Finding(
+        severity="blocker", code="LOW_CONFIDENCE_MODEL", title="t", detail="d", action="a"
+    )
+    monkeypatch.setattr(pipeline, "collect_findings", lambda context: (blocker,))
+
+    out = tmp_path / "params"
+    assert (
+        cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--export", str(out)])
+        == cli.EXIT_BLOCKED
+    )
+    assert not out.exists() or not list(out.glob("*.param"))
+
+
+def test_a_session_can_be_saved_and_reopened_without_the_log(
+    synthetic_log: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The whole point of the bundle: come back tomorrow, log or no log."""
+    bundle = tmp_path / "flight.rotorid"
+    assert (
+        cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+        == cli.EXIT_OK
+    )
+    assert bundle.exists()
+    capsys.readouterr()
+
+    synthetic_log.unlink()
+    assert cli.main(["session", str(bundle)]) == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "ROLL" in out
+    assert "margins" in out

@@ -15,11 +15,21 @@ one.
 from __future__ import annotations
 
 import html
+import math
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from rotorid.core.types import LogBundle, TuneRecommendation
+import numpy as np
+
+from rotorid.core.guidance.explain import GLOSSARY, explain, explainable, glossary_for
+from rotorid.core.types import (
+    Finding,
+    FlightTestPlan,
+    FloatArray,
+    LogBundle,
+    TuneRecommendation,
+)
 
 __all__ = ["write_report"]
 
@@ -60,12 +70,19 @@ def write_report(
     *,
     config_hash: str,
     tool_version: str,
+    findings: tuple[Finding, ...] = (),
+    plan: FlightTestPlan | None = None,
 ) -> Path:
     """Write the session report.
 
     Args:
         recommendations: Axis name to recommendation. Axes that failed to identify
             are simply absent, and the report says which and why elsewhere.
+        findings: What the tool noticed. Shown before the numbers, because a
+            reader who scrolls straight to the gains should have already passed
+            the reason not to trust them.
+        plan: The staged flight plan. Shown last, because it is what the reader
+            leaves with.
 
     Returns:
         The path written, for convenience.
@@ -73,9 +90,13 @@ def write_report(
     parts = [
         _header(bundle, config_hash, tool_version),
         _safety_block(),
+        _findings_section(findings),
     ]
     for axis, rec in recommendations.items():
-        parts.append(_axis_section(axis, rec))
+        parts.append(_axis_section(axis, rec, bundle.params))
+    if plan is not None:
+        parts.append(_plan_section(plan))
+    parts.append(_glossary_section(recommendations))
     parts.append(_log_section(bundle))
 
     document = (
@@ -115,7 +136,7 @@ def _safety_block() -> str:
     )
 
 
-def _axis_section(axis: str, rec: TuneRecommendation) -> str:
+def _axis_section(axis: str, rec: TuneRecommendation, flown: dict[str, float]) -> str:
     m = rec.margins
     rows = [
         ("Phase margin", f"{m.phase_margin_deg:.1f}", "deg"),
@@ -166,7 +187,10 @@ def _axis_section(axis: str, rec: TuneRecommendation) -> str:
         + _budget_figure(rec)
         + "<h3>Predicted step</h3>"
         + _step_table(rec)
-        + f"<div class='note'>{html.escape(rec.filters.rationale)}</div>"
+        + "<h3>Filters</h3>"
+        + _filter_section(rec, flown)
+        + "<h3>Why these numbers</h3>"
+        + _why_section(rec)
     )
 
 
@@ -286,3 +310,261 @@ def _budget_figure(rec: TuneRecommendation) -> str:
         "common-path total of "
         f"{rec.latency.common_path_deg:.1f}&deg;.</figcaption></figure>"
     )
+
+
+def _filter_section(rec: TuneRecommendation, flown: dict[str, float]) -> str:
+    """The filter half of the recommendation: what changes, what it costs, and why.
+
+    Filter parameters are shown as a diff against what was flown rather than as a
+    list of values, because the value that matters to the reader is the one that
+    is different.
+    """
+    filters = rec.filters
+    parts = [f"<p class='rationale'>{html.escape(filters.rationale)}</p>"]
+
+    if filters.params:
+        parts.append(
+            _table(
+                ("Parameter", "Current", "Recommended"),
+                [
+                    (
+                        name,
+                        _format_param(flown.get(name)),
+                        f"{value:g}",
+                    )
+                    for name, value in sorted(filters.params.items())
+                ],
+                numeric_from=1,
+                numeric_to=2,
+            )
+        )
+        parts.append(
+            "<div class='note warn'><strong>Fly these on their own.</strong> Apply the "
+            "filter changes, fly, and confirm the vehicle is still controllable before "
+            "applying the gains. Changing both at once makes a bad outcome impossible "
+            "to attribute.</div>"
+        )
+    else:
+        parts.append(
+            "<p class='rationale'>No filter parameter changes are proposed, so nothing "
+            "here needs to be written to the vehicle.</p>"
+        )
+
+    parts.append(
+        "<p class='rationale'>Chain: <code>"
+        + html.escape(filters.chain.describe())
+        + f"</code> &middot; {filters.phase_cost_deg:.1f}&deg; of phase at crossover "
+        + (
+            f"&middot; D-term output noise {rec.dterm_noise_rms_pct:.1f}% of full scale."
+            if math.isfinite(rec.dterm_noise_rms_pct)
+            else "&middot; D-term output noise was not measured: this log carries no "
+            "usable noise spectrum."
+        )
+        + "</p>"
+    )
+    parts.append(_spectrum_figure(rec))
+    if filters.rejected:
+        rows = "".join(
+            f"<tr><td>{html.escape(alternative)}</td><td>{html.escape(why)}</td></tr>"
+            for alternative, why in filters.rejected
+        )
+        parts.append(
+            "<details><summary class='rationale'>Alternatives considered and why they "
+            "lost</summary><table><tbody>" + rows + "</tbody></table></details>"
+        )
+    return "".join(parts)
+
+
+def _format_param(value: float | None) -> str:
+    """A parameter value as flown, or a note that the log never recorded it."""
+    return "not logged" if value is None else f"{value:g}"
+
+
+def _spectrum_figure(rec: TuneRecommendation) -> str:
+    """Measured pre-filter gyro spectrum against the one the new chain would leave.
+
+    The picture that makes the filter recommendation arguable: the reader can see
+    which peaks were removed, which were left, and how far down the floor went.
+    """
+    filters = rec.filters
+    f = filters.psd_f_hz
+    pre = filters.psd_pre
+    post = filters.predicted_psd_post
+    if f is None or pre is None or post is None:
+        return "<p class='rationale'>No noise spectrum was measured for this axis.</p>"
+
+    band = (f >= 5.0) & (f <= min(float(f[-1]), 500.0)) & (pre > 0.0) & (post > 0.0)
+    if band.sum() < 8:
+        return "<p class='rationale'>The noise spectrum is too narrow to plot.</p>"
+
+    f_band = f[band]
+    pre_db = 10.0 * np.log10(pre[band])
+    post_db = 10.0 * np.log10(post[band])
+
+    width, height, pad = 640.0, 240.0, 34.0
+    x0, x1 = float(np.log10(f_band[0])), float(np.log10(f_band[-1]))
+    y1 = float(max(pre_db.max(), post_db.max()))
+    y0 = float(min(pre_db.min(), post_db.min(), y1 - 20.0))
+
+    def sx(value: float) -> float:
+        return float(pad + (np.log10(value) - x0) / max(x1 - x0, 1e-9) * (width - 2.0 * pad))
+
+    def sy(value: float) -> float:
+        return height - pad - (value - y0) / max(y1 - y0, 1e-9) * (height - 2.0 * pad)
+
+    def path(values: FloatArray) -> str:
+        return " ".join(
+            f"{sx(float(freq)):.1f},{sy(float(db)):.1f}"
+            for freq, db in zip(f_band, values, strict=True)
+        )
+
+    ticks = "".join(
+        f"<text x='{sx(decade):.1f}' y='{height - pad + 14:.0f}' font-size='11' "
+        f"text-anchor='middle' fill='currentColor' opacity='.6'>{decade:g}</text>"
+        for decade in (10.0, 100.0)
+        if f_band[0] <= decade <= f_band[-1]
+    )
+
+    return (
+        f"<figure><svg viewBox='0 0 {width:.0f} {height:.0f}' role='img' "
+        f"aria-label='Gyro noise spectrum before and after the recommended filters'>"
+        f"<polyline points='{path(pre_db)}' fill='none' stroke='currentColor' "
+        f"stroke-width='1' opacity='.35'/>"
+        f"<polyline points='{path(post_db)}' fill='none' stroke='currentColor' "
+        f"stroke-width='1.5'/>"
+        f"{ticks}"
+        f"<text x='{pad:.0f}' y='{pad - 12:.0f}' font-size='11' fill='currentColor' "
+        f"opacity='.7'>dB, gyro noise vs Hz &mdash; faint: unfiltered, solid: with the "
+        f"recommended chain</text>"
+        "</svg><figcaption class='rationale'>Measured pre-filter spectrum against the "
+        "one the recommended chain would leave. Peaks still standing above the floor "
+        "here are the ones no filter was worth spending phase on.</figcaption></figure>"
+    )
+
+
+_SEVERITY_LABEL = {
+    "blocker": ("Blocking", "warn"),
+    "warning": ("Warning", "warn"),
+    "info": ("Note", ""),
+    "good": ("Good", ""),
+}
+
+
+def _findings_section(findings: tuple[Finding, ...]) -> str:
+    """What the tool noticed, worst first, each with the evidence behind it."""
+    if not findings:
+        return ""
+
+    blocks = []
+    for finding in findings:
+        label, style = _SEVERITY_LABEL[finding.severity]
+        evidence = (
+            "<p class='rationale'>"
+            + " &middot; ".join(
+                f"{html.escape(k)} = {v:.4g}" for k, v in sorted(finding.evidence.items())
+            )
+            + "</p>"
+            if finding.evidence
+            else ""
+        )
+        blocks.append(
+            f"<div class='note {style}'><strong>{label}: "
+            f"{html.escape(finding.title)}</strong> "
+            f"<code>{html.escape(finding.code)}</code>"
+            f"<p>{html.escape(finding.detail)}</p>"
+            f"<p><strong>What to do:</strong> {html.escape(finding.action)}</p>"
+            f"{evidence}</div>"
+        )
+
+    blockers = sum(1 for f in findings if f.severity == "blocker")
+    heading = "<h2>What the tool noticed</h2>"
+    if blockers:
+        heading += (
+            f"<p class='sub'>{blockers} blocking finding(s). Exports stay disabled until "
+            f"each one is acknowledged, because acting on this analysis means accepting "
+            f"a stated risk rather than overlooking it.</p>"
+        )
+    return heading + "".join(blocks)
+
+
+def _plan_section(plan: FlightTestPlan) -> str:
+    """The ordered flights. One change at a time, each with its own check."""
+    if not plan.stages:
+        return ""
+
+    blocks = [f"<h2>Next flights</h2><div class='note'>{html.escape(plan.preamble)}</div>"]
+    for stage in plan.stages:
+        changes = _table(
+            ("Parameter", "Set to"),
+            [(name, f"{value:g}") for name, value in sorted(stage.changes.items())],
+            numeric_from=1,
+        )
+        watch = "".join(f"<li>{html.escape(item)}</li>" for item in stage.watch_in_flight)
+        check = "".join(f"<li>{html.escape(item)}</li>" for item in stage.check_in_log)
+        because = (
+            "<p class='rationale'>Prompted by: "
+            + ", ".join(f"<code>{html.escape(c)}</code>" for c in stage.motivating_findings)
+            + "</p>"
+            if stage.motivating_findings
+            else ""
+        )
+        blocks.append(
+            f"<h3>Flight {stage.index}: {html.escape(stage.title)}</h3>"
+            f"{because}{changes}"
+            f"<p class='rationale'><strong>Watch for:</strong></p>"
+            f"<ul class='rationale'>{watch}</ul>"
+            f"<p class='rationale'><strong>Then check in the log:</strong></p>"
+            f"<ul class='rationale'>{check}</ul>"
+        )
+    return "".join(blocks)
+
+
+def _why_section(rec: TuneRecommendation) -> str:
+    """The trace behind each recommended number, one disclosure per number.
+
+    Collapsed rather than inline: a reader who trusts the tool should not have to
+    scroll past the reasoning, and a reader who does not should not have to ask
+    for it.
+    """
+    blocks = []
+    for key in explainable(rec):
+        exp = explain(key, rec)
+        if exp is None:  # pragma: no cover - explainable() only offers live keys
+            continue
+        reasons = "".join(f"<li>{html.escape(line)}</li>" for line in exp.because)
+        terms = (
+            "<p class='rationale'>See: "
+            + ", ".join(html.escape(e.term) for e in glossary_for(exp))
+            + "</p>"
+            if exp.glossary
+            else ""
+        )
+        blocks.append(
+            f"<details><summary><strong>{html.escape(exp.title)}</strong> = "
+            f"{html.escape(exp.value)}</summary>"
+            f"<p>{html.escape(exp.headline)}</p>"
+            f"<ul class='rationale'>{reasons}</ul>{terms}</details>"
+        )
+    return "".join(blocks)
+
+
+def _glossary_section(recommendations: dict[str, TuneRecommendation]) -> str:
+    """Definitions for every term the report actually used, and no others."""
+    used: list[str] = []
+    for rec in recommendations.values():
+        for key in explainable(rec):
+            exp = explain(key, rec)
+            if exp is None:  # pragma: no cover
+                continue
+            used += [term for term in exp.glossary if term not in used]
+    if not used:
+        return ""
+
+    entries = "".join(
+        f"<details><summary><strong>{html.escape(GLOSSARY[term].term)}</strong> &mdash; "
+        f"{html.escape(GLOSSARY[term].short)}</summary>"
+        f"<p class='rationale'>{html.escape(GLOSSARY[term].detail)}</p></details>"
+        for term in used
+        if term in GLOSSARY
+    )
+    return "<h2>Glossary</h2>" + entries

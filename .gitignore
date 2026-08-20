@@ -8,3 +8,7 @@ dist/
 build/
 *.egg-info/
 .cache/
+
+# Flight logs. Real vehicle data: large, and not ours to redistribute.
+# tests/test_real_logs.py picks up anything dropped in here and skips without.
+logs/

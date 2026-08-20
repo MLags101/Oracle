@@ -108,6 +108,10 @@ class ArduPilotReader(LogReader):
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self._warnings: list[str] = []
+        #: Canonical key to the ``MSG.Field`` it was read from. Provenance, not
+        #: decoration: a finding about a signal has to be able to name the thing
+        #: the user would change to fix it.
+        self._source_msg: dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # Pass one
@@ -233,6 +237,7 @@ class ArduPilotReader(LogReader):
             return
         unit = self._unit_of(msg, kind, field)
         units_seen.setdefault(key, unit)
+        self._source_msg.setdefault(key, f"{kind}.{field}")
         raw.setdefault(key, []).append((t, float(value) * self._scale(unit, kind, field)))
 
     def _collect(
@@ -348,7 +353,7 @@ class ArduPilotReader(LogReader):
                 key,
                 arr[:, 0],
                 arr[:, 1],
-                source_msg=units_seen.get(key, ""),
+                source_msg=self._source_msg.get(key, ""),
                 filtered=True if key.endswith(".measured") else None,
             )
             signals[key] = resample_to_grid(raw_signal, grid)

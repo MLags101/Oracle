@@ -40,10 +40,11 @@ from rotorid.core.filters.biquad import (
     onepole_alpha,
     onepole_response,
     phase_lag_deg,
+    px4_lpf2p_biquad,
 )
 from rotorid.core.filters.harmonic import HarmonicNotch, NotchOption, harmonics_from_bitmask
 
-__all__ = ["FilterChain", "OperatingPoint", "ardupilot_chain"]
+__all__ = ["FilterChain", "OperatingPoint", "ardupilot_chain", "px4_chain"]
 
 FloatArray = NDArray[np.float64]
 ComplexArray = NDArray[np.complex128]
@@ -137,7 +138,8 @@ class FilterChain:
         """
         stages: list[BiquadCoeffs] = []
         if self.gyro_lpf_hz:
-            stages.append(lpf2p_biquad(self.gyro_lpf_hz, self.sample_rate_hz))
+            lpf = px4_lpf2p_biquad if self.stack == "px4" else lpf2p_biquad
+            stages.append(lpf(self.gyro_lpf_hz, self.sample_rate_hz))
         for notch in self.notches:
             stages.extend(notch.stages(self._notch_centers(notch, op)))
         return stages
@@ -162,7 +164,22 @@ class FilterChain:
         return self._onepole(self.error_lpf_hz, f_hz)
 
     def dterm_lpf_response(self, f_hz: FloatArray) -> ComplexArray:
-        """``FLTD`` / ``IMU_DGYRO_CUTOFF``. Derivative branch only."""
+        """``FLTD`` / ``IMU_DGYRO_CUTOFF``. Derivative branch only.
+
+        The two stacks do not filter this branch the same way, and the difference
+        is not cosmetic. ArduPilot's ``FLTD`` is a 1-pole IIR running at the loop
+        rate; PX4's ``IMU_DGYRO_CUTOFF`` is a 2-pole Butterworth running at the
+        gyro rate, on the angular *acceleration* estimate. At the same cutoff the
+        2-pole costs roughly twice the phase, so modelling one with the other
+        would misprice the D term on every PX4 aircraft.
+        """
+        if self.stack == "px4":
+            if not self.dterm_lpf_hz:
+                return np.ones_like(np.asarray(f_hz, dtype=np.float64), dtype=np.complex128)
+            return cascade_response(
+                [px4_lpf2p_biquad(self.dterm_lpf_hz, self.sample_rate_hz)],
+                np.asarray(f_hz, dtype=np.float64),
+            )
         return self._onepole(self.dterm_lpf_hz, f_hz)
 
     def target_lpf_response(self, f_hz: FloatArray) -> ComplexArray:
@@ -224,10 +241,12 @@ class FilterChain:
             parts.append(f"gyro LPF {self.gyro_lpf_hz:g} Hz")
         for notch in self.notches:
             harmonics = "+".join(str(h) for h in notch.harmonics)
+            # PX4 notches have no attenuation setting, so printing one would
+            # invite a user to go looking for a parameter that does not exist.
+            depth = "" if notch.flavor == "px4" else f"att {notch.attenuation_db:g} dB "
             parts.append(
                 f"notch {notch.freq_hz:g} Hz BW {notch.bandwidth_hz:g} "
-                f"att {notch.attenuation_db:g} dB harmonics {harmonics}"
-                + (" per-motor" if notch.per_motor else "")
+                f"{depth}harmonics {harmonics}" + (" per-motor" if notch.per_motor else "")
             )
         if self.dterm_lpf_hz:
             parts.append(f"D LPF {self.dterm_lpf_hz:g} Hz")
@@ -297,4 +316,93 @@ def ardupilot_chain(
         error_lpf_hz=params.get(f"ATC_RAT_{suffix}_FLTE") or None,
         target_lpf_hz=params.get(f"ATC_RAT_{suffix}_FLTT") or None,
         all_imus=all_imus,
+    )
+
+
+#: ``IMU_GYRO_DNF_EN`` bits.
+class DynamicNotchSource:
+    """Bit values of ``IMU_GYRO_DNF_EN``."""
+
+    ESC_RPM = 1 << 0
+    FFT = 1 << 1
+
+
+def px4_chain(
+    params: dict[str, float],
+    axis: Axis,
+    *,
+    gyro_sample_rate_hz: float,
+    loop_rate_hz: float,
+) -> FilterChain:
+    """Build a :class:`FilterChain` from a PX4 parameter snapshot.
+
+    Reads ``IMU_GYRO_CUTOFF``, the two static notches ``IMU_GYRO_NF0_*`` and
+    ``IMU_GYRO_NF1_*``, the dynamic notch ``IMU_GYRO_DNF_*``, and
+    ``IMU_DGYRO_CUTOFF``.
+
+    Three things differ from the ArduPilot reader in ways that change the answer
+    rather than only the parameter names:
+
+    * PX4's notches are true nulls with no attenuation setting, so the depth
+      column is not a design variable on this stack (see
+      :func:`~rotorid.core.filters.biquad.px4_notch_A_Q`).
+    * ``IMU_GYRO_DNF_MIN`` is an absolute frequency floor, expressed here as a
+      ratio of the fundamental so one notch type serves both stacks.
+    * There is no error or target low-pass. PX4's rate controller has neither, and
+      inventing them would put phase in the feedback path that the aircraft does
+      not have.
+
+    Args:
+        axis: Accepted for symmetry with :func:`ardupilot_chain`. PX4's filters
+            are per-IMU rather than per-axis, so every axis gets the same chain --
+            which is itself worth knowing when comparing the two stacks.
+    """
+    del axis  # PX4 filters are per-IMU, not per-axis.
+
+    notches: list[HarmonicNotch] = []
+    for prefix in ("IMU_GYRO_NF0", "IMU_GYRO_NF1"):
+        freq = float(params.get(f"{prefix}_FRQ", 0.0))
+        bandwidth = float(params.get(f"{prefix}_BW", 0.0))
+        if freq <= 0.0 or bandwidth <= 0.0:
+            continue
+        notches.append(
+            HarmonicNotch(
+                freq_hz=freq,
+                bandwidth_hz=bandwidth,
+                attenuation_db=0.0,
+                harmonics=(1,),
+                sample_rate_hz=gyro_sample_rate_hz,
+                flavor="px4",
+            )
+        )
+
+    enabled = int(params.get("IMU_GYRO_DNF_EN", 0))
+    if enabled:
+        harmonics = tuple(range(1, int(params.get("IMU_GYRO_DNF_HMC", 3)) + 1))
+        minimum = float(params.get("IMU_GYRO_DNF_MIN", 0.0))
+        # The dynamic notch has no configured centre: it follows the motors. The
+        # minimum is the only frequency the parameters name, so it stands in as
+        # the reference the operating point scales from.
+        notches.append(
+            HarmonicNotch(
+                freq_hz=minimum,
+                bandwidth_hz=float(params.get("IMU_GYRO_DNF_BW", 0.0)),
+                attenuation_db=0.0,
+                harmonics=harmonics or (1,),
+                sample_rate_hz=gyro_sample_rate_hz,
+                freq_min_ratio=1.0,
+                flavor="px4",
+            )
+        )
+
+    return FilterChain(
+        stack="px4",
+        sample_rate_hz=gyro_sample_rate_hz,
+        loop_rate_hz=loop_rate_hz,
+        gyro_lpf_hz=params.get("IMU_GYRO_CUTOFF") or None,
+        notches=tuple(notches),
+        notch_ref=None,
+        dterm_lpf_hz=params.get("IMU_DGYRO_CUTOFF") or None,
+        error_lpf_hz=None,
+        target_lpf_hz=None,
     )

@@ -49,6 +49,7 @@ __all__ = [
     "noise_floor_db",
     "noise_profile",
     "prefilter_psd",
+    "steady_window",
 ]
 
 #: Median filter half-width, in log-frequency decades, used to estimate the floor
@@ -73,6 +74,15 @@ _STATIONARY_WANDER = 0.02
 _MIN_TRACK_SPAN = 0.05
 
 _HARMONIC_TOLERANCE = 0.12
+
+#: Fractional motor-speed variation allowed inside the window the spectrum is
+#: measured over. A tone that moves during the record is smeared across the
+#: average, and a smeared tone is not a peak.
+_STEADY_TOLERANCE = 0.05
+
+#: Shortest window worth taking a spectrum over. Below this the resolution is too
+#: coarse to separate a line from its neighbours.
+_STEADY_MIN_SECONDS = 4.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +195,50 @@ def _throttle_trace(
     return t, np.asarray(np.mean(stacked, axis=0), dtype=np.float64)
 
 
+def steady_window(
+    track: MotorTrack,
+    t_start: float,
+    t_end: float,
+    *,
+    tolerance: float = _STEADY_TOLERANCE,
+    min_duration_s: float = _STEADY_MIN_SECONDS,
+) -> tuple[float, float]:
+    """The longest stretch over which motor speed barely moved.
+
+    Spectra are measured here rather than over the whole record. A tone that
+    sweeps with the throttle is smeared across a full-record average -- a 25%
+    speed swing turns a 180 Hz third harmonic into a 45 Hz-wide hump, which is not
+    a peak and cannot be measured as one. Tracking classification still uses the
+    whole record, because it needs the motion this window deliberately excludes.
+
+    Falls back to the full window when there is no motor trace, or when nothing in
+    the flight was steady for long enough.
+    """
+    if track.f_hz.size < 2 or track.t.size != track.f_hz.size:
+        return t_start, t_end
+
+    f = track.f_hz
+    t = track.t
+    best = (t_start, t_end)
+    best_duration = 0.0
+    j = 0
+    for i in range(f.size):
+        j = max(j, i + 1)
+        while j < f.size:
+            window = f[i : j + 1]
+            mean = float(np.mean(window))
+            if mean <= 0.0 or float(np.ptp(window)) / mean > tolerance:
+                break
+            j += 1
+        duration = float(t[j - 1] - t[i])
+        if duration > best_duration:
+            best_duration, best = duration, (float(t[i]), float(t[j - 1]))
+
+    if best_duration < min_duration_s:
+        return t_start, t_end
+    return best
+
+
 # --------------------------------------------------------------------------- #
 # Spectra
 # --------------------------------------------------------------------------- #
@@ -267,17 +321,31 @@ def classify_peaks(
     peaks: tuple[tuple[float, float, float], ...],
     track: MotorTrack,
     *,
-    correlation_min: float,
+    track_margin_db: float,
     t_start: float,
     t_end: float,
+    fundamental_hz: float = 0.0,
 ) -> tuple[SpectralPeak, ...]:
-    """Decide what each peak is by watching it move.
+    """Decide what each peak is by testing it against the motor speed directly.
 
-    A spectrogram gives one ridge frequency per frame inside a band around each
-    peak. If that ridge correlates with motor speed, the peak tracks RPM. If motor
-    speed never changed enough to correlate against -- a steady hover -- the
-    correlation is meaningless, and the fallback is whether the ridge moved at
-    all: a peak that stayed put is structural.
+    For each peak the spectrogram is read along two loci: the frequency the peak
+    would follow if it tracked the motors, and the constant frequency it would
+    keep if it did not. Whichever locus carries more energy is what the peak is
+    doing. Testing the hypothesis this way rather than correlating a ridge
+    position matters when peaks are close together -- a ridge tracker inside a
+    band around the second harmonic will happily lock onto a strong frame
+    resonance 6 Hz away and report that the harmonic is stationary.
+
+    Where the motors never changed speed there is nothing to test against, and
+    the fallback is whether the peak moved at all: one that stayed exactly put
+    over the whole record is structural.
+
+    Args:
+        fundamental_hz: Motor fundamental *at the operating point the spectrum was
+            measured at*, for labelling harmonics. Not the mean over the whole
+            window, which is a different number whenever the throttle moved.
+        track_margin_db: How much more energy the tracking locus must carry before
+            the peak counts as following the motors.
     """
     window = (signal.t >= t_start) & (signal.t <= t_end)
     y = signal.y[window]
@@ -299,13 +367,20 @@ def classify_peaks(
     track_frames = track.resample(frame_times)
     track_usable = track.f_hz.size > 0 and track.span_fraction >= _MIN_TRACK_SPAN
 
-    fundamental = track.mean_hz() if track.is_measured else 0.0
+    fundamental = fundamental_hz if fundamental_hz > 0.0 else 0.0
+
+    reference = fundamental_hz if fundamental_hz > 0.0 else track.mean_hz()
 
     for f_peak, db, width in peaks:
         ridge = _ridge(f_grid, sxx, f_peak, width)
         wander = float(np.ptp(ridge) / f_peak) if f_peak > 0.0 else 0.0
-        correlation = _correlation(ridge, track_frames) if track_usable else float("nan")
-        tracks = bool(track_usable and correlation >= correlation_min)
+        usable = track_usable and reference > 0.0
+        advantage = (
+            _tracking_advantage_db(f_grid, sxx, f_peak, track_frames, reference)
+            if usable
+            else float("nan")
+        )
+        tracks = bool(usable and advantage >= track_margin_db)
 
         kind: Literal["motor_fundamental", "motor_harmonic", "structural", "broadband", "unknown"]
         harmonic: int | None = None
@@ -344,13 +419,33 @@ def _ridge(f_grid: FloatArray, sxx: FloatArray, f_peak: float, width: float) -> 
     return np.asarray(sub_f[np.argmax(sxx[band, :], axis=0)], dtype=np.float64)
 
 
-def _correlation(a: FloatArray, b: FloatArray) -> float:
-    """Pearson correlation, 0.0 where either series is constant."""
-    if a.size != b.size or a.size < 3:
-        return 0.0
-    if np.std(a) <= 0.0 or np.std(b) <= 0.0:
-        return 0.0
-    return float(np.corrcoef(a, b)[0, 1])
+def _tracking_advantage_db(
+    f_grid: FloatArray,
+    sxx: FloatArray,
+    f_peak: float,
+    track_frames: FloatArray,
+    reference: float,
+) -> float:
+    """How much more energy sits on the tracking locus than on a fixed frequency.
+
+    The locus is scaled so it passes through ``f_peak`` at the operating point the
+    spectrum was measured at, which is what makes this a fair comparison: both
+    loci agree there, and they diverge only as the motors change speed.
+    """
+    if reference <= 0.0 or sxx.shape[1] != track_frames.size:
+        return float("nan")
+    locus = f_peak * track_frames / reference
+    moving = np.array(
+        [np.interp(locus[k], f_grid, sxx[:, k]) for k in range(sxx.shape[1])], dtype=np.float64
+    )
+    fixed = np.array(
+        [np.interp(f_peak, f_grid, sxx[:, k]) for k in range(sxx.shape[1])], dtype=np.float64
+    )
+    total_moving = float(np.mean(moving))
+    total_fixed = float(np.mean(fixed))
+    if total_fixed <= 0.0 or total_moving <= 0.0:
+        return float("nan")
+    return float(10.0 * np.log10(total_moving / total_fixed))
 
 
 def _harmonic_index(f_peak: float, fundamental: float) -> int | None:
@@ -358,7 +453,7 @@ def _harmonic_index(f_peak: float, fundamental: float) -> int | None:
     if fundamental <= 0.0:
         return None
     ratio = f_peak / fundamental
-    nearest = int(round(ratio))
+    nearest = round(ratio)
     if nearest < 1 or abs(ratio - nearest) > _HARMONIC_TOLERANCE * max(nearest, 1):
         return None
     return nearest
@@ -438,6 +533,22 @@ def dterm_noise_rms(
 # --------------------------------------------------------------------------- #
 
 
+def _fundamental_at(track: MotorTrack, t_start: float, t_end: float) -> float:
+    """Mean measured motor frequency over the window the spectrum was taken from."""
+    if not track.is_measured or track.f_hz.size == 0:
+        return 0.0
+    window = (track.t >= t_start) & (track.t <= t_end)
+    if not window.any():
+        return track.mean_hz()
+    return float(np.mean(track.f_hz[window]))
+
+
+#: Below this ceiling a spectrum cannot contain a multirotor motor fundamental,
+#: so there is nothing a notch could be aimed at. Small quads run 150-400 Hz and
+#: large ones 50-100 Hz; 50 Hz is the bottom of the range that exists at all.
+_MIN_NOISE_CEILING_HZ = 50.0
+
+
 def noise_profile(
     bundle: LogBundle,
     axis: Axis,
@@ -447,9 +558,10 @@ def noise_profile(
     chain: FilterChain | None = None,
     op: OperatingPoint | None = None,
     prominence_db: float = 6.0,
-    correlation_min: float = 0.7,
+    track_margin_db: float = 3.0,
     deconv_floor_db: float = -20.0,
     nperseg: int | None = None,
+    evidence_ceiling_hz: float | None = None,
 ) -> NoiseProfile:
     """Characterize the gyro noise on one axis over one window.
 
@@ -459,8 +571,20 @@ def noise_profile(
     :attr:`~rotorid.core.types.NoiseProfile.has_pre_filter` and matters: the
     reconstruction is only as good as the filter model.
 
+    Args:
+        evidence_ceiling_hz: Highest frequency the gyro message was actually
+            logged fast enough to describe. Everything above it in the spectrum
+            is interpolation, and interpolation of a jittered 10 Hz message
+            produces a forest of evenly-spaced lines that look exactly like frame
+            resonances. The spectrum is truncated here rather than filtered
+            afterwards, because a peak that is an artefact should never reach the
+            classifier at all.
+
     Raises:
-        ValueError: if the axis has no rate measurement in the log.
+        ValueError: if the axis has no rate measurement in the log, or if the
+            evidence ceiling is too low for any motor line to be inside it. No
+            noise profile at all is the right answer there: a filter recommended
+            from a spectrum that cannot contain the motors is worse than none.
     """
     from rotorid.core.analysis.spectra import power_spectrum
 
@@ -468,7 +592,9 @@ def noise_profile(
     if key not in bundle.signals:
         raise ValueError(f"{key} is not in the log; no noise analysis is possible for {axis}")
     signal = bundle.signals[key]
-    window = (signal.t >= t_start) & (signal.t <= t_end)
+    track = motor_track(bundle, t_start, t_end)
+    spectrum_start, spectrum_end = steady_window(track, t_start, t_end)
+    window = (signal.t >= spectrum_start) & (signal.t <= spectrum_end)
     y = signal.y[window]
     if y.size < 64:
         raise ValueError(f"{axis}: only {y.size} samples in the window; too short for a spectrum")
@@ -478,18 +604,31 @@ def noise_profile(
         nperseg = int(min(2 ** np.floor(np.log2(y.size / 4.0)), 4096))
     f_hz, psd_post = power_spectrum(y, fs, nperseg=max(nperseg, 64))
 
+    if evidence_ceiling_hz is not None:
+        if evidence_ceiling_hz < _MIN_NOISE_CEILING_HZ:
+            raise ValueError(
+                f"{axis}: {key} was logged fast enough to describe frequencies only up to "
+                f"{evidence_ceiling_hz:.1f} Hz, which is below anywhere a multirotor's motors "
+                f"put their fundamental. There is no noise spectrum here to design a filter from."
+            )
+        inside = f_hz <= evidence_ceiling_hz
+        f_hz, psd_post = f_hz[inside], psd_post[inside]
+
     prefilter_key = f"gyro.{axis}.prefilter"
+    pre_source: Literal["measured", "reconstructed", "none"] = "none"
     if prefilter_key in bundle.signals:
         pre_signal = bundle.signals[prefilter_key]
-        pre_window = (pre_signal.t >= t_start) & (pre_signal.t <= t_end)
+        pre_window = (pre_signal.t >= spectrum_start) & (pre_signal.t <= spectrum_end)
         f_pre, psd_pre_raw = power_spectrum(
             pre_signal.y[pre_window], pre_signal.rate_hz, nperseg=max(nperseg, 64)
         )
         # Batch-logged gyro runs at the sensor rate, not the analysis grid rate, so
         # its spectrum lands on a different grid and has to be brought onto ours.
         psd_pre = np.asarray(np.interp(f_hz, f_pre, psd_pre_raw), dtype=np.float64)
+        pre_source = "measured"
     elif chain is not None:
         psd_pre = prefilter_psd(f_hz, psd_post, chain, op=op, floor_db=deconv_floor_db)
+        pre_source = "reconstructed"
     else:
         psd_pre = None
 
@@ -498,9 +637,14 @@ def noise_profile(
     # a recommendation built on that would remove the notch and reintroduce the peak.
     search_psd = psd_pre if psd_pre is not None else psd_post
     raw_peaks = find_spectral_peaks(f_hz, search_psd, prominence_db=prominence_db)
-    track = motor_track(bundle, t_start, t_end)
     peaks = classify_peaks(
-        signal, raw_peaks, track, correlation_min=correlation_min, t_start=t_start, t_end=t_end
+        signal,
+        raw_peaks,
+        track,
+        track_margin_db=track_margin_db,
+        t_start=t_start,
+        t_end=t_end,
+        fundamental_hz=_fundamental_at(track, spectrum_start, spectrum_end),
     )
 
     with np.errstate(divide="ignore"):
@@ -515,5 +659,6 @@ def noise_profile(
         noise_floor_db=floor,
         peaks=peaks,
         psd_pre=psd_pre,
+        pre_filter_source=pre_source,
         motor_fundamental_track=track.f_hz if track.f_hz.size else None,
     )

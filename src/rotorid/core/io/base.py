@@ -13,6 +13,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
+
 from rotorid.core.types import AXES, FloatArray, LogBundle, Signal
 
 __all__ = [
@@ -20,6 +22,7 @@ __all__ = [
     "LogReader",
     "ProgressCallback",
     "canonical_signal",
+    "native_rate_hz",
     "signal_units",
 ]
 
@@ -94,7 +97,36 @@ def canonical_signal(
     units = signal_units(key)
     if t.shape != y.shape:
         raise ValueError(f"{key}: {t.shape} timestamps for {y.shape} values")
-    return Signal(name=key, t=t, y=y, units=units, source_msg=source_msg, filtered=filtered)
+    return Signal(
+        name=key,
+        t=t,
+        y=y,
+        units=units,
+        source_msg=source_msg,
+        filtered=filtered,
+        native_rate_hz=native_rate_hz(t),
+    )
+
+
+def native_rate_hz(t: FloatArray) -> float | None:
+    """The rate a message was logged at, from its own timestamps.
+
+    The *median* interval, not the mean: a log with a handful of gaps -- a
+    dropped SD write, a mode change, a moment the scheduler overran -- would have
+    its mean interval dragged out by those few, and the answer we want is the
+    rate the message was scheduled at, which the bulk of the samples agree on.
+
+    Returns:
+        The rate in Hz, or ``None`` if there are too few samples, or if every
+        interval is zero (which some logs produce for a burst-written message).
+    """
+    if t.size < 3:
+        return None
+    dt = np.diff(np.sort(t))
+    dt = dt[dt > 0.0]
+    if dt.size == 0:
+        return None
+    return float(1.0 / np.median(dt))
 
 
 class LogReader(ABC):

@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["PySide6>=6.6", "pyqtgraph>=0.13"]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+dev = ["pytest>=8.0", "pytest-qt>=4.4", "ruff>=0.6", "mypy>=1.11"]
 
 [project.scripts]
 rotorid = "rotorid.cli:main"
@@ -70,7 +70,7 @@ disallow_any_generics = false   # numpy arrays are pervasive and awkward to full
 # Literal["literal", "constant", False], which does not include the documented and
 # widely used "linear". Contorting correct code to satisfy a stub bug is worse than
 # treating the library as untyped.
-module = ["control.*", "pymavlink.*", "scipy.*"]
+module = ["control.*", "pymavlink.*", "pyqtgraph.*", "pyulog.*", "scipy.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

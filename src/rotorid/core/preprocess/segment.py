@@ -30,10 +30,21 @@ _CONFIDENCE = {
 #: otherwise the single-axis assumption behind the identification is violated.
 _CROSS_AXIS_QUIET_RATIO = 0.4
 
-#: Fallback detection: high-pass corner, and the multiple of the median envelope
-#: that counts as "excited".
+#: Fallback detection: high-pass corner, and what counts as "excited".
+#:
+#: The threshold is a fraction of the axis's own *peak* rather than a multiple of
+#: its median, and that choice matters more than it looks. A deliberate slow-to-
+#: fast sweep -- exactly the thing worth identifying from -- has a nearly flat
+#: envelope, so it never rises to several times its own median and a
+#: median-relative rule cannot see it at all. It can only find bursts, which is
+#: the one kind of excitation that identifies badly.
 _ENERGY_HIGHPASS_HZ = 0.3
-_ENERGY_THRESHOLD_RATIO = 3.0
+_EXCITED_FRACTION_OF_PEAK = 0.3
+
+#: Below this peak envelope, in normalized mixer output, there is not enough
+#: signal to identify anything and the "excitation" is the controller reacting to
+#: air. 1% of full output is already a very small stick input.
+_ENERGY_MIN_AMPLITUDE = 0.01
 
 #: Shorter than this and there is no low-frequency information in the window.
 _MIN_SEGMENT_S = 5.0
@@ -124,9 +135,10 @@ def _energy_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
     out: list[ExcitationSegment] = []
     for axis in AXES:
         others = np.maximum.reduce([envelopes[a] for a in AXES if a != axis])
-        threshold = _ENERGY_THRESHOLD_RATIO * float(np.median(envelopes[axis]))
-        if threshold <= 0.0:
+        peak = float(np.max(envelopes[axis]))
+        if peak < _ENERGY_MIN_AMPLITUDE:
             continue
+        threshold = _EXCITED_FRACTION_OF_PEAK * peak
         excited = (envelopes[axis] > threshold) & (
             others < envelopes[axis] * _CROSS_AXIS_QUIET_RATIO
         )

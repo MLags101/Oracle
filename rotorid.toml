@@ -29,7 +29,12 @@ pm_floor_deg = 25.0          # HARD floor. Flight test finds 20-23 deg gives PIO
 crossover_frac_of_loop = 0.2 # f_c <= 0.2 * (loop_rate / 2)
 
 [filters]
-target_noise_floor_db = -50.0   # ArduPilot guidance: below -50 dB does not need a notch
+# How proud a spectral line may still stand above the local noise floor once the
+# filters have done their work. ArduPilot's own guidance is stated the other way
+# round -- a peak more than 50 dB below the signal does not need a notch at all --
+# but "above the local floor" is what the peak finder measures, so the threshold
+# is expressed in those terms and the two are not interchangeable.
+peak_target_excess_db = 6.0
 phase_budget_deg = 25.0         # max filter-chain phase lag allowed at design crossover
 max_harmonics = 3               # ArduPilot doc: "three harmonics is usually safe"
 freq_bw_ratio_default = 2.0     # ArduPilot doc default (BW = FREQ/2)
@@ -44,7 +49,9 @@ deconv_floor_db = -20.0         # clamp |F| this far below unity when dividing o
 [noise]
 dterm_output_rms_limit_pct = 5.0   # project default: D output RMS as % of full motor range
 peak_prominence_db = 6.0
-rpm_track_correlation_min = 0.7    # above this a peak counts as RPM-tracking
+# A peak counts as RPM-tracking when the spectrogram carries this much more energy
+# along the frequency the motors would drag it to than along a fixed frequency.
+rpm_track_margin_db = 3.0
 
 [design]
 outer_loop_separation = 4.0     # inner/outer timescale separation (3-5x rule)
