@@ -421,3 +421,134 @@ def test_findings_point_at_the_document_for_the_stack_in_hand() -> None:
             assert finding.doc_link == "docs/logging-setup-px4.md", finding.code
         for ardupilot_only in ("INS_LOG_BAT", "LOG_BITMASK", "SID_", "ATC_RAT_"):
             assert ardupilot_only not in finding.action, f"{finding.code}: {finding.action}"
+
+
+# --------------------------------------------------------------------------- #
+# PX4's own autotune, ingested and compared (M9)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def autotuned(tmp_path: Path) -> Path:
+    return write_px4_log(tmp_path / "autotune.ulg", duration_s=20.0, with_autotune=True)
+
+
+def test_an_autotune_run_becomes_a_stack_agnostic_gate(autotuned: Path) -> None:
+    """ArduPilot says it in the event log, PX4 in a status topic, both land here."""
+    bundle = read_px4(autotuned)
+    gate = bundle.signals["mode.autotune"]
+    assert set(np.unique(gate.y)) <= {0.0, 1.0}
+    assert gate.y.any()
+    assert not gate.y.all(), "the fixture is idle at both ends and the gate should say so"
+
+
+def test_a_log_with_an_autotune_in_it_reads_as_a_tuning_flight(autotuned: Path) -> None:
+    assert read_px4(autotuned).kind == "tuning"
+
+
+def test_px4s_own_gains_are_ingested_rather_than_ignored(autotuned: Path) -> None:
+    """A second opinion about the same aircraft is the only external check there is."""
+    vendor = read_px4(autotuned).vendor_tunes
+    assert len(vendor) == 1
+    assert vendor[0].source == "px4_autotune"
+    assert vendor[0].fitness == pytest.approx(0.02, rel=1e-3)
+    assert len(vendor[0].coefficients) == 5
+
+
+def test_the_k_factor_is_resolved_for_the_autotune_too(autotuned: Path) -> None:
+    """The same conversion the parameter reader does, for the same reason.
+
+    PX4 publishes the autotune result in standard form -- an overall ``kc`` with
+    the proportional term at unity -- so the effective gains are ``kc``,
+    ``kc * ki`` and ``kc * kd``. A number that arrived in a different
+    parameterization and was not converted is a silent factor error in every
+    comparison downstream.
+    """
+    vendor = read_px4(autotuned).vendor_tunes[0]
+    kc, ki, kd = 0.15, 0.2, 0.003
+    assert vendor.gains.kp == pytest.approx(kc, rel=1e-4)
+    assert vendor.gains.ki == pytest.approx(kc * ki, rel=1e-4)
+    assert vendor.gains.kd == pytest.approx(kc * kd, rel=1e-4)
+
+
+def test_the_converged_value_is_taken_not_the_average(tmp_path: Path) -> None:
+    """An autotune's intermediate values are a search, not an answer."""
+    log = write_px4_log(
+        tmp_path / "converged.ulg",
+        duration_s=20.0,
+        with_autotune=True,
+        autotune_gains=(0.4, 0.1, 0.01),
+    )
+    assert read_px4(log).vendor_tunes[0].gains.kp == pytest.approx(0.4, rel=1e-4)
+
+
+def test_the_axis_comes_from_which_one_moved_not_from_the_state_enum(autotuned: Path) -> None:
+    """The enum has been renumbered between releases; the aircraft has not.
+
+    The fixture excites roll hardest, so roll is the answer whatever number the
+    state field happens to carry.
+    """
+    assert read_px4(autotuned).vendor_tunes[0].axis == "roll"
+
+
+def test_a_log_without_an_autotune_carries_no_vendor_opinion(log: Path) -> None:
+    """Absent, not zero. A tuner that did not run has not agreed with anything."""
+    bundle = read_px4(log)
+    assert bundle.vendor_tunes == ()
+    assert "mode.autotune" not in bundle.signals
+
+
+def test_a_disagreement_between_the_two_tuners_is_reported(autotuned: Path) -> None:
+    """One of them describes a vehicle that does not exist, and it matters which."""
+    from rotorid.core.guidance.findings import check_vendor_tune
+
+    bundle = read_px4(autotuned)
+    vendor = bundle.vendor_tunes[0]
+    ours = _recommendation_scaled_from(vendor, factor=4.0)
+    findings = check_vendor_tune(_context(bundle, {vendor.axis: ours}))
+    assert [f.code for f in findings] == ["VENDOR_TUNE_DISAGREES"]
+    assert findings[0].severity == "warning"
+
+
+def test_agreement_between_the_two_tuners_is_reported_too(autotuned: Path) -> None:
+    """Two independent estimates landing together is evidence neither can produce alone."""
+    from rotorid.core.guidance.findings import check_vendor_tune
+
+    bundle = read_px4(autotuned)
+    vendor = bundle.vendor_tunes[0]
+    ours = _recommendation_scaled_from(vendor, factor=1.1)
+    findings = check_vendor_tune(_context(bundle, {vendor.axis: ours}))
+    assert [f.code for f in findings] == ["VENDOR_TUNE_AGREES"]
+    assert findings[0].severity == "good"
+
+
+def _recommendation_scaled_from(vendor, *, factor: float):
+    """A recommendation that is the vendor's answer scaled by a known factor.
+
+    Built rather than analysed, and scaled from the vendor's own numbers rather
+    than invented: what is under test is the ratio the check computes, so the
+    fixture has to control that ratio exactly. Every term is scaled together,
+    because a fixture that moved P and D by different factors would be testing
+    the check's choice of worst term rather than its threshold.
+    """
+    from unittest.mock import Mock
+
+    from rotorid.core.types import GainSet
+
+    rec = Mock()
+    rec.gains = GainSet(
+        axis=vendor.axis,
+        kp=vendor.gains.kp * factor,
+        ki=vendor.gains.ki * factor,
+        kd=vendor.gains.kd * factor,
+        kff=0.0,
+    )
+    return rec
+
+
+def _context(bundle, recommendations):
+    from rotorid.core.guidance.findings import GuidanceContext
+
+    return GuidanceContext(
+        bundle=bundle, analyses={}, recommendations=recommendations, config=load_config()
+    )

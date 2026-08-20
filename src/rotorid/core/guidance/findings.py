@@ -57,6 +57,12 @@ _MIN_EVIDENCE_MULTIPLE_OF_CROSSOVER = 2.0
 #: Peak CPU load above which the expensive filter options stop being affordable.
 _CPU_LOAD_HIGH = 0.8
 
+#: How far the vehicle's own tuner may land from this one before the two are
+#: reported as disagreeing. A factor of 1.5 is well outside what two estimators
+#: of the same aircraft should produce and well inside what a genuine
+#: identification error produces, which is where a threshold wants to sit.
+_VENDOR_AGREEMENT_RATIO = 1.5
+
 
 @dataclass(frozen=True, slots=True)
 class GuidanceContext:
@@ -1361,6 +1367,86 @@ def _spread_code(spread: OperatingPointSpread) -> str:
     return "OPERATING_POINT_SPREAD"
 
 
+def check_vendor_tune(context: GuidanceContext) -> list[Finding]:
+    """Whether the vehicle's own tuner reached the same answer (spec 6.2).
+
+    PX4's autotune identifies an ARX model in flight and derives gains from it.
+    That is a second opinion about the same aircraft, produced by different code
+    from different data, and it is the only external check this tool ever gets.
+
+    Agreement is worth reporting because it is worth something: two independent
+    estimates landing in the same place is evidence neither one can provide
+    alone. Disagreement is worth more, because one of them is wrong about the
+    vehicle the user is about to fly and no amount of internal consistency will
+    reveal which.
+    """
+    out: list[Finding] = []
+    for vendor in context.bundle.vendor_tunes:
+        recommendation = context.recommendations.get(vendor.axis)
+        if recommendation is None:
+            continue
+        ours, theirs = recommendation.gains, vendor.gains
+        ratio = max(_ratio(theirs.kp, ours.kp), _ratio(theirs.kd, ours.kd))
+        evidence = {
+            "their_kp": theirs.kp,
+            "our_kp": ours.kp,
+            "their_kd": theirs.kd,
+            "our_kd": ours.kd,
+            "worst_ratio": ratio,
+        }
+        if vendor.fitness is not None:
+            evidence["their_fitness"] = vendor.fitness
+
+        if ratio <= _VENDOR_AGREEMENT_RATIO:
+            out.append(
+                Finding(
+                    severity="good",
+                    code="VENDOR_TUNE_AGREES",
+                    title=f"{vendor.axis}: PX4's own autotune reached similar gains",
+                    detail=(
+                        f"PX4's autotune, running on this flight, arrived at P "
+                        f"{theirs.kp:.4f} and D {theirs.kd:.5f}; this analysis recommends "
+                        f"P {ours.kp:.4f} and D {ours.kd:.5f}. Two estimators with nothing "
+                        f"in common but the aircraft agreeing to within "
+                        f"{(ratio - 1.0) * 100:.0f}% is evidence neither of them can "
+                        f"produce on its own."
+                    ),
+                    action="Nothing.",
+                    evidence=evidence,
+                )
+            )
+            continue
+
+        out.append(
+            Finding(
+                severity="warning",
+                code="VENDOR_TUNE_DISAGREES",
+                title=(
+                    f"{vendor.axis}: PX4's own autotune reached gains {ratio:.1f}x away from these"
+                ),
+                detail=(
+                    f"PX4's autotune arrived at P {theirs.kp:.4f} and D {theirs.kd:.5f} on "
+                    f"this flight; this analysis recommends P {ours.kp:.4f} and D "
+                    f"{ours.kd:.5f}. Both were derived from the same aircraft, so one of "
+                    f"them describes a vehicle that does not exist -- and no amount of "
+                    f"internal consistency in either will say which."
+                    + (
+                        f" PX4 reports its own fit quality as {vendor.fitness:.3g}."
+                        if vendor.fitness is not None
+                        else ""
+                    )
+                ),
+                action=(
+                    "Fly the more conservative of the two first, at altitude, and compare "
+                    "the result against the prediction on the Validate stage. That is the "
+                    "only evidence that settles it."
+                ),
+                evidence=evidence,
+            )
+        )
+    return out
+
+
 def check_confidence(context: GuidanceContext) -> list[Finding]:
     """A low-confidence recommendation must be acknowledged, not merely noticed."""
     out: list[Finding] = []
@@ -1432,5 +1518,6 @@ CHECKS: tuple[Check, ...] = (
     check_integrator_windup,
     check_gain_step_size,
     check_operating_point,
+    check_vendor_tune,
     check_confidence,
 )

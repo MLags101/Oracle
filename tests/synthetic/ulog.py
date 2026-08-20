@@ -33,7 +33,12 @@ _MSG_ADD_LOGGED = ord("A")
 _MSG_FLAG_BITS = ord("B")
 
 #: uLog type name to struct format. Only the types this writer emits.
-_TYPES = {"uint64_t": "Q", "float": "f", "int32_t": "i"}
+_TYPES = {"uint64_t": "Q", "float": "f", "int32_t": "i", "uint8_t": "B"}
+
+#: Types that have to be packed as integers rather than floats. Getting this
+#: wrong produces a struct error rather than a wrong file, which is the good
+#: failure mode, but the list still has to exist.
+_INTEGER_TYPES = frozenset({"uint64_t", "int32_t", "uint8_t"})
 
 
 class ULogWriter:
@@ -77,7 +82,10 @@ class ULogWriter:
         packer = struct.Struct("<" + "".join(_TYPES[t] for t, _ in all_fields))
         for i in range(t_us.size):
             values: list[float | int] = [int(t_us[i])]
-            values += [float(samples[field][i]) for _, field in all_fields[1:]]
+            values += [
+                int(samples[field][i]) if kind in _INTEGER_TYPES else float(samples[field][i])
+                for kind, field in all_fields[1:]
+            ]
             self._data.append((msg_id, packer.pack(*values)))
         return self
 
@@ -125,6 +133,8 @@ def write_px4_log(
     rate_hz: float = 400.0,
     params: dict[str, float] | None = None,
     with_esc: bool = True,
+    with_autotune: bool = False,
+    autotune_gains: tuple[float, float, float] = (0.15, 0.2, 0.003),
     torque_topic: str = "vehicle_torque_setpoint",
 ) -> Path:
     """A small but structurally real PX4 log.
@@ -138,6 +148,14 @@ def write_px4_log(
         torque_topic: Which name the rate-controller output goes under. Older PX4
             logged ``actuator_controls_0``; the reader has to accept both, and
             that fallback is only meaningfully tested by writing the old one.
+        with_autotune: Add ``autotune_attitude_control_status``, PX4's own
+            identification output. Written as a converging run rather than a
+            constant, because the reader is specified to take the last sample of
+            each run -- an autotune's intermediate values are a search, not an
+            answer, and a fixture that held still would not catch a reader that
+            averaged them.
+        autotune_gains: The ``(kc, ki, kd)`` the run converges to, in PX4's own
+            standard form. Effective gains are ``kc``, ``kc * ki``, ``kc * kd``.
     """
     t = np.arange(0.0, duration_s, 1.0 / rate_hz)
     phase = 2.0 * np.pi * 0.5 * t
@@ -190,6 +208,38 @@ def write_px4_log(
             "q[3]": np.zeros_like(t),
         },
     )
+    if with_autotune:
+        kc, ki, kd = autotune_gains
+        # Idle, then a run that converges, then idle again -- the shape the
+        # window detector and the last-sample rule are both written against.
+        n = t.size
+        state = np.zeros(n)
+        running = (t > 0.25 * duration_s) & (t < 0.75 * duration_s)
+        state[running] = 3.0
+        approach = np.linspace(0.4, 1.0, int(np.count_nonzero(running)))
+        ramp = np.zeros(n)
+        ramp[running] = approach
+        writer.topic(
+            "autotune_attitude_control_status",
+            [
+                ("uint8_t", "state"),
+                ("float", "kc"),
+                ("float", "ki"),
+                ("float", "kd"),
+                ("float", "fitness"),
+                *[("float", f"coeff[{i}]") for i in range(5)],
+            ],
+            {
+                "timestamp": t,
+                "state": state,
+                "kc": kc * ramp,
+                "ki": np.full(n, ki),
+                "kd": kd * ramp,
+                "fitness": 0.02 * ramp,
+                **{f"coeff[{i}]": np.full(n, 0.1 * (i + 1)) for i in range(5)},
+            },
+        )
+
     if with_esc:
         t_esc = t[::40]
         writer.topic(

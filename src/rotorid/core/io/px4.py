@@ -41,7 +41,16 @@ from rotorid.core.preprocess.resample import (
     resample_to_grid,
     uniform_grid,
 )
-from rotorid.core.types import AXES, Axis, FloatArray, LogBundle, LogKind, Signal
+from rotorid.core.types import (
+    AXES,
+    Axis,
+    FloatArray,
+    GainSet,
+    LogBundle,
+    LogKind,
+    Signal,
+    VendorTune,
+)
 
 __all__ = ["PX4Reader", "read_px4"]
 
@@ -100,6 +109,20 @@ def read_px4(
     """
     bundle = PX4Reader(path).read(progress)
     return replace(bundle, declared_kind=kind) if kind is not None else bundle
+
+
+def _value(dataset: Any, field: str, index: int) -> float | None:
+    """One field of one sample, or ``None`` when the topic does not carry it.
+
+    uLog topics gain and lose fields between releases, so every read of a
+    vendor-specific field has to tolerate its absence rather than assume the
+    schema this was written against.
+    """
+    values = dataset.data.get(field)
+    if values is None or index >= len(values):
+        return None
+    value = float(values[index])
+    return value if np.isfinite(value) else None
 
 
 class PX4Reader(LogReader):
@@ -389,6 +412,7 @@ class PX4Reader(LogReader):
             signals["mode.autotune"] = gate_signal(
                 "mode.autotune", grid, autotune, source_msg=f"{_AUTOTUNE_TOPIC}.state"
             )
+        vendor = self._vendor_tunes(datasets, autotune, signals)
 
         if _FIFO_TOPIC not in datasets:
             self._warnings.append(
@@ -412,7 +436,98 @@ class PX4Reader(LogReader):
             signals=signals,
             params=params,
             warnings=tuple(self._warnings),
+            vendor_tunes=vendor,
         )
+
+    def _vendor_tunes(
+        self,
+        datasets: dict[str, Any],
+        windows: list[tuple[float, float]],
+        signals: dict[str, Signal],
+    ) -> tuple[VendorTune, ...]:
+        """What PX4's own autotune concluded, one entry per run (spec 6.2).
+
+        Read as a second opinion, never as an input. PX4 identifies an ARX model
+        in flight and derives gains from it, and both are published -- so where
+        the two tools agree the user has two independent estimates of the same
+        aircraft, and where they disagree one of them is wrong about the vehicle
+        the user is about to fly.
+
+        The *last* sample of each run is taken rather than an average: autotune
+        converges, so the intermediate values are a search rather than an answer.
+
+        The axis comes from which one was moving, not from the ``state`` enum.
+        The enum encodes a phase of the procedure and has been renumbered between
+        releases; the aircraft has not.
+        """
+        dataset = datasets.get(_AUTOTUNE_TOPIC)
+        if dataset is None or not windows:
+            return ()
+        t = np.asarray(dataset.data["timestamp"], dtype=np.float64) / 1.0e6
+
+        out: list[VendorTune] = []
+        for start, end in windows:
+            inside = (t >= start) & (t <= end)
+            if not inside.any():
+                continue
+            last = int(np.nonzero(inside)[0][-1])
+            axis = self._busiest_axis(signals, start, end)
+            if axis is None:
+                continue
+            gains = self._autotune_gains(dataset, last, axis)
+            if gains is None:
+                continue
+            out.append(
+                VendorTune(
+                    source="px4_autotune",
+                    axis=axis,
+                    gains=gains,
+                    t_start=start,
+                    t_end=end,
+                    fitness=_value(dataset, "fitness", last),
+                    coefficients=tuple(
+                        value
+                        for index in range(5)
+                        for value in (_value(dataset, f"coeff[{index}]", last),)
+                        if value is not None
+                    ),
+                )
+            )
+        return tuple(out)
+
+    @staticmethod
+    def _autotune_gains(dataset: Any, index: int, axis: Axis) -> GainSet | None:
+        """PX4's suggested gains for one axis, converted to effective gains.
+
+        PX4's autotune publishes the controller in the same standard form the
+        parameters use: an overall ``kc`` with the proportional term at unity, so
+        the effective gains are ``kc``, ``kc * ki`` and ``kc * kd``. That
+        conversion happens here for the same reason it happens in
+        :func:`~rotorid.core.preprocess.params.px4_gain_set` -- so that nothing
+        downstream has to remember which parameterization a number arrived in.
+        """
+        kc = _value(dataset, "kc", index)
+        if kc is None:
+            return None
+        ki = _value(dataset, "ki", index) or 0.0
+        kd = _value(dataset, "kd", index) or 0.0
+        return GainSet(axis=axis, kp=kc, ki=kc * ki, kd=kc * kd, kff=0.0)
+
+    @staticmethod
+    def _busiest_axis(signals: dict[str, Signal], t_start: float, t_end: float) -> Axis | None:
+        """Which axis was being moved over a window, by mixer-command energy."""
+        best: tuple[float, Axis] | None = None
+        for axis in AXES:
+            signal = signals.get(f"rate.{axis}.output")
+            if signal is None:
+                continue
+            window = (signal.t >= t_start) & (signal.t <= t_end)
+            if not window.any():
+                continue
+            energy = float(np.std(signal.y[window]))
+            if best is None or energy > best[0]:
+                best = (energy, axis)
+        return best[1] if best is not None else None
 
     def _measured_rate(self, datasets: dict[str, Any]) -> float:
         """Gyro rate read off the timestamps, when no parameter declares it."""

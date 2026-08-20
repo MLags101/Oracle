@@ -51,6 +51,7 @@ __all__ = [
     "SpectralPeak",
     "StepMetrics",
     "TuneRecommendation",
+    "VendorTune",
 ]
 
 Axis = Literal["roll", "pitch", "yaw"]
@@ -198,6 +199,10 @@ class LogBundle:
     #: disagreement between the two stays visible instead of being resolved
     #: silently in favour of whichever was written last.
     declared_kind: LogKind | None = None
+    #: What the vehicle's own tuner concluded, if it ran. Empty on ArduPilot,
+    #: whose autotune publishes gains to parameters rather than to the log, so
+    #: there is nothing to read back that is distinguishable from the flown tune.
+    vendor_tunes: tuple[VendorTune, ...] = ()
 
     @property
     def kind(self) -> LogKind:
@@ -650,6 +655,46 @@ class TuneRecommendation:
 # --------------------------------------------------------------------------- #
 # Guidance
 # --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class VendorTune:
+    """What the vehicle's own tuner concluded, ingested rather than ignored.
+
+    PX4's multicopter autotune identifies an ARX model in flight and derives
+    gains from it, and it publishes both. That is a second opinion about the same
+    aircraft, produced by different code from different data, and it is far too
+    useful to throw away: where it agrees with this tool the user has two
+    independent estimates, and where it disagrees one of them is wrong about
+    their vehicle and they need to know before they fly either.
+
+    It is never used as an input. The point is the comparison.
+
+    Attributes:
+        source: What produced it, e.g. ``"px4_autotune"``. Named rather than
+            assumed, because the conventions differ: what a vendor calls ``kd``
+            is not always the derivative gain this tool means by it.
+        gains: Converted to *effective* gains, on the same terms as
+            :func:`~rotorid.core.preprocess.params.gains_from_bundle` produces --
+            so the comparison is between two numbers that mean the same thing.
+        fitness: The vendor's own confidence in its fit, on its own scale. Kept
+            unnormalized and reported as-is: rescaling somebody else's
+            goodness-of-fit onto our scale would be inventing a comparison.
+        axis: Decided by which axis was actually moving during the run, not by
+            the vendor's state enum. The enum has been renumbered between
+            releases; the aircraft has not.
+    """
+
+    source: str
+    axis: Axis
+    gains: GainSet
+    t_start: float
+    t_end: float
+    fitness: float | None = None
+    #: The vendor's identified model coefficients, in whatever form it published
+    #: them. Carried for the report rather than interpreted: an ARX polynomial in
+    #: an unstated sample time is not something to convert silently.
+    coefficients: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
