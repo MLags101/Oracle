@@ -42,6 +42,7 @@ __all__ = [
     "LatencyBudget",
     "LogBundle",
     "MarginReport",
+    "MeasuredStep",
     "NoiseProfile",
     "Session",
     "Signal",
@@ -535,6 +536,45 @@ class StepMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class MeasuredStep:
+    """A step response recovered from flight data.
+
+    Attributes:
+        t: Seconds from the step, starting at zero.
+        y: The stacked step, in the same units as the rate signals: a value of
+            1.0 means the aircraft ended up doing what it was told.
+        spread: Per-sample standard deviation across the accepted windows. The
+            honest part of the plot -- a mean over 40 windows that disagree by
+            30% is not the same measurement as a mean over 40 that agree, and
+            drawing them the same way would be a lie of presentation.
+        n_windows: How many windows were stacked.
+        n_rejected: How many were looked at and thrown away, so that "measured
+            from 4 windows out of 200" is visible rather than implied.
+        metrics: Rise, overshoot, settling and steady-state error, computed by
+            the *same* function that computes them for the predicted step. The
+            two numbers are only comparable because nothing differs but the
+            input.
+        scatter: ``spread`` averaged over the response and divided by where the
+            step settled -- one number for how much the windows agreed with each
+            other. Precision, not accuracy: averaging more windows drives it down
+            whether or not the answer is getting closer to the aircraft, which is
+            exactly why it is reported and not used as a gate.
+        explained: Median fraction of the measured rate's variance that the
+            recovered response accounts for, across the accepted windows. This is
+            the number that says whether to believe the result.
+    """
+
+    t: FloatArray
+    y: FloatArray
+    spread: FloatArray
+    n_windows: int
+    n_rejected: int
+    metrics: StepMetrics
+    scatter: float
+    explained: float
+
+
+@dataclass(frozen=True, slots=True)
 class GainSet:
     """Rate-loop gains for one axis, in effective (not stack-parameterized) form.
 
@@ -648,6 +688,11 @@ class Session:
     created_utc: datetime
     next_steps: FlightTestPlan | None = None
     acknowledgements: dict[str, str] = field(default_factory=dict)
+    #: The step each axis was measured to have flown, where the log supported one.
+    #: Kept on the session rather than only on the analysis so that a reopened
+    #: ``.rotorid`` bundle can still draw the measurement beside the prediction --
+    #: which is the whole content of the validation screen.
+    measured_steps: dict[Axis, MeasuredStep] = field(default_factory=dict)
 
     @property
     def blockers(self) -> tuple[Finding, ...]:

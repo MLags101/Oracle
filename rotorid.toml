@@ -23,6 +23,46 @@ bias_warn_deg = 10.0  # the same comparison in phase
 warn_m_s2 = 15.0
 blocker_m_s2 = 30.0
 
+[deconv]
+# Geometry for the measured step response, from Plasmatree's PID-Analyzer, which
+# has been extracting step responses from arbitrary blackbox flight data on these
+# numbers for years. A multirotor rate loop settles in well under half a second,
+# so a 1.5 s window holds the whole response several times over.
+window_s = 1.5
+response_s = 0.5
+stride_s = 0.2
+# Wiener regularizer, as a fraction of the mean input power in the window. Sets
+# how far the deconvolution is allowed to amplify a frequency the pilot did not
+# excite. Larger is blunter and safer; project default.
+regularization = 0.02
+# A window whose setpoint moved less than this fraction of the whole record's
+# swing is deconvolving noise against noise. Project default.
+min_window_swing_frac = 0.1
+# A recovered step has to end up near unity or it is not a step response. Beyond
+# this the window held something that was not one linear system. Project default.
+max_steady_state_error = 0.5
+# How much of the measured rate the recovered response has to account for before
+# the window counts as evidence. Calibrated against the closed-loop simulator,
+# where this tracks the error from known truth closely and -- unlike the scatter
+# between windows -- reads the same whether the excitation was an injected chirp
+# or a pilot's stick. At 0.90 the recovered step is within about 0.17 of truth on
+# a step of order 1; by 0.80 it is out by twice that.
+min_explained = 0.90
+# One window is an anecdote. Project default.
+min_windows = 8
+
+[validate]
+# Measured step against the step this model predicts for the gains that were
+# actually flown. Both bounds are wide, and deliberately: the deconvolution's
+# regularizer low-passes the recovered response, so a measured rise time reads
+# slow even when the model is right, and the identification's own scatter moves
+# the prediction the other way. On the closed-loop simulator, a correct model
+# produces ratios from 1.1 to 1.6 across the usable noise range. This catches a
+# model that is wrong by a factor, which is the failure worth catching; it is not
+# a precision instrument and the finding says so.
+rise_ratio_bounds = [0.6, 1.8]
+max_overshoot_diff_pct = 15.0
+
 [coherence]
 threshold = 0.6              # project default; below this an FRF bin is not trusted
 min_valid_octaves = 1.0      # narrower than this around crossover -> COHERENCE_NARROW_BAND

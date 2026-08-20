@@ -29,6 +29,7 @@ from rotorid.core.types import (
     FlightTestPlan,
     FloatArray,
     LogBundle,
+    MeasuredStep,
     TuneRecommendation,
 )
 
@@ -73,6 +74,7 @@ def write_report(
     tool_version: str,
     findings: tuple[Finding, ...] = (),
     plan: FlightTestPlan | None = None,
+    measured_steps: dict[str, MeasuredStep] | None = None,
 ) -> Path:
     """Write the session report.
 
@@ -84,6 +86,9 @@ def write_report(
             the reason not to trust them.
         plan: The staged flight plan. Shown last, because it is what the reader
             leaves with.
+        measured_steps: The step each axis was measured to have flown. Printed
+            beside the prediction, which is the one place in the report where a
+            number came out of the log rather than out of the model.
 
     Returns:
         The path written, for convenience.
@@ -94,7 +99,7 @@ def write_report(
         _findings_section(findings),
     ]
     for axis, rec in recommendations.items():
-        parts.append(_axis_section(axis, rec, bundle.params))
+        parts.append(_axis_section(axis, rec, bundle.params, (measured_steps or {}).get(axis)))
     if plan is not None:
         parts.append(_plan_section(plan))
     parts.append(_glossary_section(recommendations))
@@ -137,7 +142,12 @@ def _safety_block() -> str:
     )
 
 
-def _axis_section(axis: str, rec: TuneRecommendation, flown: dict[str, float]) -> str:
+def _axis_section(
+    axis: str,
+    rec: TuneRecommendation,
+    flown: dict[str, float],
+    measured: MeasuredStep | None = None,
+) -> str:
     m = rec.margins
     rows = [
         ("Phase margin", f"{m.phase_margin_deg:.1f}", "deg"),
@@ -186,8 +196,8 @@ def _axis_section(axis: str, rec: TuneRecommendation, flown: dict[str, float]) -
         )
         + "<h3>Where the phase goes at crossover</h3>"
         + _budget_figure(rec)
-        + "<h3>Predicted step</h3>"
-        + _step_table(rec)
+        + "<h3>Step response</h3>"
+        + _step_table(rec, measured)
         + "<h3>Filters</h3>"
         + _filter_section(rec, flown)
         + "<h3>Why these numbers</h3>"
@@ -216,17 +226,51 @@ def _model_table(rec: TuneRecommendation) -> str:
     return _table(("Quantity", "Value"), rows, numeric_from=1)
 
 
-def _step_table(rec: TuneRecommendation) -> str:
+def _step_table(rec: TuneRecommendation, measured: MeasuredStep | None = None) -> str:
+    """Predicted step for the recommended gains, and the flown one beside it.
+
+    The two columns are not the same experiment and the caption says so. The
+    prediction is for the *recommended* tune; the measurement is of the tune the
+    aircraft was flying when the log was recorded. They are printed together
+    because the measured column is the only number on this page that did not come
+    out of the model -- not because they should match.
+    """
     s = rec.predicted_step
-    return _table(
-        ("Metric", "Value"),
+    rows = [
+        ("Rise time (10-90%)", f"{s.rise_time_s * 1000.0:.0f} ms"),
+        ("Overshoot", f"{s.overshoot_pct:.1f} %"),
+        ("Settling time (2%)", f"{s.settling_time_s * 1000.0:.0f} ms"),
+        ("Peak time", f"{s.peak_time_s * 1000.0:.0f} ms"),
+    ]
+    table = _table(("Metric", "Recommended tune, predicted"), rows, numeric_from=1)
+    if measured is None:
+        return table + (
+            "<p class='note'>The step the aircraft actually flew could not be measured "
+            "from this log. That needs a rate setpoint that moved: a flight spent holding "
+            "still has nothing to deconvolve.</p>"
+        )
+
+    m = measured.metrics
+    flown = _table(
+        ("Metric", "Flown tune, measured from the log"),
         [
-            ("Rise time (10-90%)", f"{s.rise_time_s * 1000.0:.0f} ms"),
-            ("Overshoot", f"{s.overshoot_pct:.1f} %"),
-            ("Settling time (2%)", f"{s.settling_time_s * 1000.0:.0f} ms"),
-            ("Peak time", f"{s.peak_time_s * 1000.0:.0f} ms"),
+            ("Rise time (10-90%)", f"{m.rise_time_s * 1000.0:.0f} ms"),
+            ("Overshoot", f"{m.overshoot_pct:.1f} %"),
+            (
+                "Windows stacked",
+                f"{measured.n_windows} of {measured.n_windows + measured.n_rejected}",
+            ),
+            ("Response explained", f"{measured.explained * 100.0:.0f} %"),
         ],
         numeric_from=1,
+    )
+    return (
+        table + flown + "<p class='note'>The two columns describe different tunes -- the one being "
+        "recommended and the one that was flown -- so they are not expected to match. "
+        "What the measured column is for is checking the model against reality: the "
+        "STEP_RESPONSE findings compare it against what this model predicts the "
+        "<em>flown</em> gains should have done. Note also that the deconvolution used to "
+        "recover it reads rise time slightly slow, by roughly a sixth.</p>"
     )
 
 

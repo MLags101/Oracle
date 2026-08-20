@@ -25,6 +25,7 @@ from typing import Literal
 import numpy as np
 
 from rotorid.config import Config
+from rotorid.core.analysis.deconv import MeasuredStep, measured_step
 from rotorid.core.analysis.instrument import Rung, choose_instrument, windowed_signals
 from rotorid.core.analysis.margins import LoopDelay, design_grid, loop_delay
 from rotorid.core.analysis.noise import MotorTrack, motor_track, noise_profile
@@ -59,6 +60,7 @@ from rotorid.core.types import (
     FrequencyResponse,
     LogBundle,
     NoiseProfile,
+    StepMetrics,
     TuneRecommendation,
 )
 
@@ -127,6 +129,17 @@ class AxisAnalysis:
     delay: LoopDelay
     noise: NoiseProfile | None
     track: MotorTrack | None
+    #: The step the aircraft actually flew, deconvolved from the log. ``None``
+    #: when the log could not support one -- which is a different statement from
+    #: a flat step, and the two are never allowed to look alike.
+    measured: MeasuredStep | None = None
+    #: What this model predicts the step would have been *under the gains the log
+    #: was flown with*, over exactly the window ``measured`` covers. Not the
+    #: recommended gains: comparing the flown response against a prediction for a
+    #: different tune would only measure that the recommendation changed something.
+    #: The pair is an end-to-end check of the identification against flown data --
+    #: the only one in the tool that does not go through the model twice.
+    flown_prediction: StepMetrics | None = None
 
 
 def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis:
@@ -259,9 +272,9 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     )
     airframe = fit_airframe(
         plant,
-        wn_bounds_hz=_pair(config, "fit", "wn_bounds_hz"),
-        zeta_bounds=_pair(config, "fit", "zeta_bounds"),
-        tau_bounds_ms=_pair(config, "fit", "tau_bounds_ms"),
+        wn_bounds_hz=config.pair("fit", "wn_bounds_hz"),
+        zeta_bounds=config.pair("fit", "zeta_bounds"),
+        tau_bounds_ms=config.pair("fit", "tau_bounds_ms"),
     )
     # The fit knows how the filters were removed but not how the loop was. Both
     # halves of that provenance travel with the model, because everything that
@@ -271,6 +284,18 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
 
     noise, track = _noise_for(bundle, axis, segments, chain, op, config, ceiling)
 
+    # Over the whole record, not the identification segments. Identification wants
+    # the stretches that made a good frequency response; this wants every stick
+    # input the pilot ever made, and a flight with one usable sweep can easily
+    # have two hundred usable steps outside it.
+    measured = measured_step(bundle, axis, config)
+    delay = _delay_for(bundle, config)
+    flown_prediction = (
+        _flown_prediction(bundle, axis, airframe, chain, delay, op, measured)
+        if measured is not None
+        else None
+    )
+
     return AxisAnalysis(
         axis=axis,
         segments=segments,
@@ -279,10 +304,43 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
         airframe=airframe,
         chain=chain,
         operating_point=op,
-        delay=_delay_for(bundle, config),
+        delay=delay,
         noise=noise,
         track=track,
+        measured=measured,
+        flown_prediction=flown_prediction,
     )
+
+
+def _flown_prediction(
+    bundle: LogBundle,
+    axis: Axis,
+    airframe: AirframeModel,
+    chain: FilterChain,
+    delay: LoopDelay,
+    op: OperatingPoint,
+    measured: MeasuredStep,
+) -> StepMetrics | None:
+    """Predicted step for the gains the log was flown with, over the measured window.
+
+    Same duration and same sample rate as the measurement, because rise time and
+    overshoot are both read off a finite record: a prediction computed over four
+    seconds and a measurement covering half a second would disagree about settling
+    for reasons that have nothing to do with the aircraft.
+    """
+    try:
+        flown = gains_from_bundle(bundle, axis)
+    except (KeyError, ValueError):
+        return None
+    t, y = step_response(
+        controller_for(bundle.stack, flown, chain),
+        airframe,
+        delay=delay,
+        op=op,
+        duration_s=float(measured.t.size) / bundle.sample_rate_hz,
+        sample_rate_hz=bundle.sample_rate_hz,
+    )
+    return step_metrics(t, y)
 
 
 def analyze_axis(
@@ -345,7 +403,17 @@ def recommend_from(
 
     controller = controller_for(bundle.stack, result.gains, designed_chain)
     t, y = step_response(
-        controller, analysis.airframe, delay=analysis.delay, op=analysis.operating_point
+        controller,
+        analysis.airframe,
+        delay=analysis.delay,
+        op=analysis.operating_point,
+        # Longer than the plot the Design stage draws, and for a different reason.
+        # Rise and overshoot happen in the first fraction of a second either way,
+        # but settling time and steady-state error are measured against where the
+        # response ended up, and an integrator with a one-second time constant has
+        # not finished in the second and a half a pilot judges the feel by. Cutting
+        # it there would publish a steady-state error the tune does not have.
+        duration_s=4.0,
     )
     budget = build_budget(
         result.margins.crossover_hz,
@@ -372,19 +440,6 @@ def recommend_from(
         conservatism=conservatism,
         binding_constraint=result.binding_constraint,
     )
-
-
-def _pair(config: Config, section: str, key: str) -> tuple[float, float]:
-    """A config list that must be exactly a low/high bound.
-
-    Raises:
-        ValueError: if the list is not a pair. A three-element "range" would
-            otherwise be silently truncated to its first two entries.
-    """
-    values = config.floats(section, key)
-    if len(values) != 2:
-        raise ValueError(f"[{section}].{key} must be a [low, high] pair, got {list(values)}")
-    return values[0], values[1]
 
 
 def _estimator_disagreement(

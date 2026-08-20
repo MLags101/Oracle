@@ -277,6 +277,96 @@ def check_vibration(context: GuidanceContext) -> list[Finding]:
     ]
 
 
+def check_step_response(context: GuidanceContext) -> list[Finding]:
+    """Whether the model reproduces the step the aircraft actually flew.
+
+    The only check in the tool that closes the loop back onto flown data. Every
+    other one asks whether the identification was well-conditioned; this asks
+    whether it was *right*, by predicting what the flown gains should have done
+    and comparing that against what the log says they did. A model that is wrong
+    about the aircraft can still be perfectly coherent, well fitted and narrowly
+    banded, and it will fail here.
+
+    Deliberately a coarse instrument. The deconvolution's regularizer low-passes
+    the recovered response, so a measured rise time reads slow even when the model
+    is right, and the thresholds have to leave room for that. It catches a model
+    that is wrong by a factor, not one that is wrong by a fifth.
+    """
+    low, high = context.config.pair("validate", "rise_ratio_bounds")
+    max_overshoot = context.config.float_("validate", "max_overshoot_diff_pct")
+
+    out: list[Finding] = []
+    for axis in context.axes():
+        analysis = context.analyses[axis]
+        measured, predicted = analysis.measured, analysis.flown_prediction
+        if measured is None or predicted is None:
+            continue
+        if not np.isfinite(measured.metrics.rise_time_s) or predicted.rise_time_s <= 0.0:
+            continue
+
+        ratio = measured.metrics.rise_time_s / predicted.rise_time_s
+        overshoot_gap = measured.metrics.overshoot_pct - predicted.overshoot_pct
+        evidence = {
+            "measured_rise_ms": measured.metrics.rise_time_s * 1000.0,
+            "predicted_rise_ms": predicted.rise_time_s * 1000.0,
+            "rise_ratio": ratio,
+            "measured_overshoot_pct": measured.metrics.overshoot_pct,
+            "predicted_overshoot_pct": predicted.overshoot_pct,
+            "windows": float(measured.n_windows),
+            "explained": measured.explained,
+        }
+
+        if low <= ratio <= high and abs(overshoot_gap) <= max_overshoot:
+            out.append(
+                Finding(
+                    severity="good",
+                    code="STEP_RESPONSE_AGREES",
+                    title=f"{axis}: the model reproduces the flown step response",
+                    detail=(
+                        f"The step deconvolved from {measured.n_windows} windows of this "
+                        f"flight rises in {measured.metrics.rise_time_s * 1000:.0f} ms with "
+                        f"{measured.metrics.overshoot_pct:.0f}% overshoot; the identified "
+                        f"model, driven by the gains the aircraft was flying, predicts "
+                        f"{predicted.rise_time_s * 1000:.0f} ms and "
+                        f"{predicted.overshoot_pct:.0f}%. The identification is not just "
+                        f"well-conditioned, it describes this aircraft."
+                    ),
+                    action="Nothing to do.",
+                    evidence=evidence,
+                    plot_hint="step",
+                )
+            )
+            continue
+
+        out.append(
+            Finding(
+                severity="warning",
+                code="STEP_RESPONSE_DISAGREES",
+                title=f"{axis}: the model does not reproduce the flown step response",
+                detail=(
+                    f"Measured from the log: {measured.metrics.rise_time_s * 1000:.0f} ms "
+                    f"rise, {measured.metrics.overshoot_pct:.0f}% overshoot, over "
+                    f"{measured.n_windows} windows. Predicted by the identified model under "
+                    f"the gains that were flown: {predicted.rise_time_s * 1000:.0f} ms and "
+                    f"{predicted.overshoot_pct:.0f}%. These describe different aircraft. "
+                    f"Every margin and every recommended gain in this report was computed "
+                    f"against the prediction, so if the measurement is the true one, they "
+                    f"are all computed against a vehicle that does not exist."
+                ),
+                action=(
+                    "Compare the two curves on the Validate stage before using these gains. "
+                    "The usual causes are a filter chain the tool has modelled differently "
+                    "from the firmware, a gain change part-way through the flight, or a "
+                    "manoeuvre that saturated the motors -- none of which the frequency "
+                    "response alone can see."
+                ),
+                evidence=evidence,
+                plot_hint="step",
+            )
+        )
+    return out
+
+
 def check_clipping(context: GuidanceContext) -> list[Finding]:
     """Whether an accelerometer saturated while the model was being measured.
 
@@ -979,6 +1069,7 @@ def _ratio(new: float, old: float) -> float:
 CHECKS: tuple[Check, ...] = (
     check_vibration,
     check_clipping,
+    check_step_response,
     check_excitation,
     check_identification_band,
     check_log_rate,

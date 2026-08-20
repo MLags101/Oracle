@@ -44,16 +44,30 @@ def step_response(
     Returns:
         ``(t, y)`` in seconds and rad/s, for a 1 rad/s commanded step.
     """
-    n = round(duration_s * sample_rate_hz)
-    t = np.arange(n, dtype=np.float64) / sample_rate_hz
+    n_keep = round(duration_s * sample_rate_hz)
+    t = np.arange(n_keep, dtype=np.float64) / sample_rate_hz
+
+    # Evaluated over four times the span that is kept. An inverse FFT is a
+    # *circular* inverse, so whatever of the impulse response has not decayed by
+    # the end of the record reappears at the start of it -- which reads as an
+    # aircraft that begins responding before it is commanded. Padding pushes the
+    # wrap-around out past the part anyone looks at.
+    n = 4 * n_keep
     f = np.fft.rfftfreq(n, d=1.0 / sample_rate_hz)
+    # The integrator and any 1/s term are infinite at f = 0. Evaluate just below
+    # the first real bin and set the DC value explicitly afterwards, rather than
+    # letting an inf propagate through the division and come back as a NaN.
+    f_eval = f.copy()
+    f_eval[0] = f[1] * 1e-3
 
     # The forward path from the mixer command, without the sensor filters: the
     # gyro filters are in the feedback path, not between the controller and the
     # airframe, so the commanded response is not shaped by them.
-    forward = airframe_response(airframe, f) * delay.response(f)
-    L = controller.feedback_response(f) * plant_path(f, controller, airframe, delay=delay, op=op)
-    T = controller.reference_response(f) * forward / (1.0 + L)
+    forward = airframe_response(airframe, f_eval) * delay.response(f_eval)
+    L = controller.feedback_response(f_eval) * plant_path(
+        f_eval, controller, airframe, delay=delay, op=op
+    )
+    T = controller.reference_response(f_eval) * forward / (1.0 + L)
 
     if controller.gains.ki > 0.0:
         # An integrator has infinite gain at DC, so the closed loop tracks a
@@ -62,8 +76,12 @@ def step_response(
         # steady-state error that the real controller does not have.
         T[0] = 1.0
 
-    step = np.ones(n, dtype=np.float64)
-    y = np.fft.irfft(np.fft.rfft(step) * T, n=n)
+    # The step is the running sum of the impulse response. Not a multiplication
+    # by the transform of a constant: the DFT of a constant sequence is a single
+    # spike at DC, so that produces T(0) at every sample and nothing else -- a
+    # flat line, for any controller and any aircraft.
+    impulse = np.fft.irfft(T, n=n)
+    y = np.cumsum(impulse)[:n_keep]
     return t, np.asarray(y, dtype=np.float64)
 
 

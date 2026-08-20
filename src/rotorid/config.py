@@ -101,6 +101,18 @@ class Config:
             raise TypeError(f"config [{section}].{key} = {value!r} is not an integer")
         return value
 
+    def pair(self, section: str, key: str) -> tuple[float, float]:
+        """Return one value as exactly a ``(low, high)`` bound.
+
+        Raises:
+            ValueError: if the list is not a pair. A three-element "range" would
+                otherwise be silently truncated to its first two entries.
+        """
+        values = self.floats(section, key)
+        if len(values) != 2:
+            raise ValueError(f"[{section}].{key} must be a [low, high] pair, got {list(values)}")
+        return values[0], values[1]
+
     def floats(self, section: str, key: str) -> tuple[float, ...]:
         """Return one value as a tuple of floats."""
         value = self.get(section, key)

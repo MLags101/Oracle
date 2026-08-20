@@ -215,6 +215,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             tool_version=__version__,
             findings=findings,
             plan=plan,
+            measured_steps={str(a): m for a, m in session.measured_steps.items()},
         )
 
     if args.session is not None:

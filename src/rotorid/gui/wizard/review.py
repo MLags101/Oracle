@@ -223,6 +223,7 @@ class ReviewStage(StageWidget):
             tool_version=__version__,
             findings=result.session.findings,
             plan=result.session.next_steps,
+            measured_steps={str(a): m for a, m in result.session.measured_steps.items()},
         )
 
     def _save_session(self) -> None:

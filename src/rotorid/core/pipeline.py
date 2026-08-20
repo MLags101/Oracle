@@ -159,6 +159,7 @@ def analyze(
         effective={axis: a.effective for axis, a in analyses.items()},
         models={axis: a.airframe for axis, a in analyses.items()},
         noise={axis: a.noise for axis, a in analyses.items() if a.noise is not None},
+        measured_steps={axis: a.measured for axis, a in analyses.items() if a.measured is not None},
         recommendations=recommendations,
         findings=findings,
         config_hash=config.hash,

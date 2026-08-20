@@ -48,7 +48,12 @@ from rotorid.core.types import (
 )
 from tests.synthetic.generators import chirp, make_airframe, make_chain
 
-__all__ = ["ClosedLoopFlight", "make_closed_loop_bundle", "simulate_closed_loop"]
+__all__ = [
+    "ClosedLoopFlight",
+    "inner_loop_step",
+    "make_closed_loop_bundle",
+    "simulate_closed_loop",
+]
 
 #: Where the SYSTEMID waveform is added. ArduPilot's ``SID_AXIS`` 7-9 add it to
 #: the rate target, upstream of the rate controller; 10-12 add it to the actuator
@@ -398,3 +403,69 @@ def _pilot_stick(
 
 def _real(spectrum: ComplexArray, n: int) -> FloatArray:
     return np.asarray(np.fft.irfft(spectrum, n=n), dtype=np.float64)
+
+
+def inner_loop_step(
+    airframe: AirframeModel | None = None,
+    chain: FilterChain | None = None,
+    *,
+    gains: tuple[float, float, float] = (0.135, 0.135, 0.0036),
+    loop_rate_hz: float = 400.0,
+    duration_s: float = 0.5,
+    sample_rate_hz: float | None = None,
+    op: OperatingPoint | None = None,
+) -> tuple[FloatArray, FloatArray]:
+    """The rate-setpoint-to-rate-measured step of the loop this module simulates.
+
+    Ground truth for anything that claims to recover a step response from these
+    logs. Eliminating the measurement from ``u = C (r - y)``, ``y = P u + F n``
+    gives ``y = [CP / (1 + CP)] r`` plus a noise path, so the inner closed loop is
+    ``T = CP / (1 + CP)`` -- independent of the attitude loop that generates ``r``,
+    which is why a deconvolution of ``r`` against ``y`` can find it at all.
+
+    Deliberately *not* :func:`rotorid.core.analysis.step.step_response`. That
+    models ArduPilot's real reference path, where the derivative term acts only on
+    the measurement; this fixture applies one controller to the error, as its own
+    equations say. Comparing a measurement against the thing that actually
+    produced it is the point -- borrowing the production predictor here would
+    leave both free to be wrong together.
+    """
+    airframe = airframe if airframe is not None else make_airframe()
+    chain = chain if chain is not None else make_chain()
+    op = op if op is not None else OperatingPoint(motor_hz=(50.0,))
+    fs = sample_rate_hz if sample_rate_hz is not None else chain.sample_rate_hz
+
+    from rotorid.core.types import GainSet
+
+    kp, ki, kd = gains
+    controller = controller_for(
+        "ardupilot",
+        GainSet(
+            axis="roll",
+            kp=kp,
+            ki=ki,
+            kd=kd,
+            kff=0.0,
+            dterm_lpf_hz=chain.dterm_lpf_hz,
+            error_lpf_hz=chain.error_lpf_hz,
+            target_lpf_hz=chain.target_lpf_hz,
+        ),
+        chain,
+    )
+    delay = loop_delay(loop_rate_hz=loop_rate_hz, actuator_ms=0.1, zoh_loops=0.5, compute_loops=1.0)
+
+    n_keep = round(duration_s * fs)
+    n = 8 * n_keep
+    f = np.fft.rfftfreq(n, d=1.0 / fs)
+    f_eval = f.copy()
+    f_eval[0] = f[1] * 1e-3
+
+    C = controller.feedback_response(f_eval)
+    P = plant_path(f_eval, controller, airframe, delay=delay, op=op)
+    T = C * P / (1.0 + C * P)
+    if ki > 0.0:
+        T[0] = 1.0
+
+    y = np.cumsum(np.fft.irfft(T, n=n))[:n_keep]
+    t = np.arange(n_keep, dtype=np.float64) / fs
+    return t, np.asarray(y, dtype=np.float64)
