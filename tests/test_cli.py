@@ -457,3 +457,31 @@ def test_validate_compares_two_logs(
     out = capsys.readouterr().out
     assert "outcome comparison only" in out, "without a session it must not claim to validate"
     assert report.exists()
+
+
+def test_every_file_writing_command_can_report_machine_readably(
+    synthetic_log: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The tool is meant to be scripted over a directory of logs (spec 14).
+
+    A command whose only output is prose is one a batch workflow has to parse
+    prose out of, and the paths it wrote are exactly what the next step needs.
+    """
+    bundle = tmp_path / "flight.rotorid"
+    cli.main(["analyze", str(synthetic_log), "--axes", "roll", "--session", str(bundle)])
+    capsys.readouterr()
+
+    assert cli.main(["report", str(bundle), "-o", str(tmp_path / "r.html"), "--json"]) == (
+        cli.EXIT_OK
+    )
+    assert json.loads(capsys.readouterr().out)["report"].endswith("r.html")
+
+    assert cli.main(["recommend", str(bundle), "-o", str(tmp_path / "p"), "--json"]) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["files"] and payload["stages"]
+
+    out = tmp_path / "collect.param"
+    assert cli.main(["profile", "--stack", "px4", "-o", str(out), "--json"]) == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["arms_excitation"] is False
+    assert payload["params"]["IMU_GYRO_FFT_EN"] == 1.0

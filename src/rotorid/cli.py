@@ -142,6 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
     report.add_argument("session", type=Path)
     report.add_argument("-o", "--report", type=Path, required=True)
     report.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    report.add_argument("--json", action="store_true")
     report.set_defaults(handler=_cmd_report)
 
     recommend = sub.add_parser("recommend", help="write .param files from a saved session")
@@ -161,6 +162,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="comma-separated finding codes to accept, unblocking the export",
     )
     recommend.add_argument("--config", type=Path, default=None, help="override rotorid.toml")
+    recommend.add_argument("--json", action="store_true")
     recommend.set_defaults(handler=_cmd_recommend)
 
     profile = sub.add_parser(
@@ -176,6 +178,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     profile.add_argument("--axis", choices=AXES, default="roll", help="axis for the sweep")
     profile.add_argument("-o", "--out", type=Path, required=True)
+    profile.add_argument("--json", action="store_true")
     profile.set_defaults(handler=_cmd_profile)
 
     gui = sub.add_parser("gui", help="open the interactive window")
@@ -609,6 +612,22 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return EXIT_BLOCKED if missed else EXIT_OK
 
 
+def _wrote(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    """Say what was written, in whichever form the caller asked for.
+
+    Every command is meant to be scriptable over a directory of logs (spec 14),
+    and a command whose only output is prose is one a batch workflow has to parse
+    prose out of. The human form stays the default because it is what a person
+    typing the command wants.
+    """
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, default=str))
+        return
+    for value in payload.get("files", []) or [payload.get("file") or payload.get("report")]:
+        if value:
+            print(f"wrote {value}")
+
+
 def _pct(change: float | None) -> str:
     return "n/a" if change is None else f"{change * 100:+.0f}%"
 
@@ -647,7 +666,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
         plan=session.next_steps,
         measured_steps={str(a): m for a, m in session.measured_steps.items()},
     )
-    print(f"wrote {args.report}")
+    _wrote(args, {"report": str(args.report), "log": session.log.path.name})
     return EXIT_OK
 
 
@@ -698,14 +717,20 @@ def _cmd_recommend(args: argparse.Namespace) -> int:
         findings=session.findings,
         acknowledgements=acknowledgements,
     )
-    for path in written:
-        print(f"wrote {path}")
+    _wrote(
+        args,
+        {
+            "files": [str(path) for path in written],
+            "stages": [stage.index for stage in plan.stages],
+            "acknowledged": sorted(acknowledgements),
+        },
+    )
     return EXIT_OK
 
 
 def _cmd_profile(args: argparse.Namespace) -> int:
     """Write the parameter file to load *before* the flight (spec 13)."""
-    from rotorid.core.export.profile import write_profile
+    from rotorid.core.export.profile import profile, write_profile
 
     write_profile(
         args.out,
@@ -714,8 +739,21 @@ def _cmd_profile(args: argparse.Namespace) -> int:
         tool_version=__version__,
         axis=cast("Axis", args.axis),
     )
-    print(f"wrote {args.out}")
-    if args.which == "sweep":
+    params, notes = profile(
+        cast("Stack", args.stack), cast("Profile", args.which), axis=cast("Axis", args.axis)
+    )
+    _wrote(
+        args,
+        {
+            "file": str(args.out),
+            "stack": args.stack,
+            "profile": args.which,
+            "arms_excitation": args.which == "sweep",
+            "params": params,
+            "notes": list(notes),
+        },
+    )
+    if args.which == "sweep" and not args.json:
         print(
             "this profile arms a deliberate excitation. Read the header before loading "
             "it, and turn it off again when the tuning campaign is over."
