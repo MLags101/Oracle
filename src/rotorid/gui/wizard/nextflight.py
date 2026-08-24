@@ -14,13 +14,14 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QFrame,
     QLabel,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from rotorid.core.types import FlightTestStage
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["NextFlightStage"]
@@ -44,29 +45,37 @@ class NextFlightStage(StageWidget):
 
     title = "Next Flight"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
 
-        layout = QVBoxLayout(self)
-        heading = QLabel("Next flight")
-        heading.setObjectName("Heading")
-        layout.addWidget(heading)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Next Flight",
+                subtitle=(
+                    "What to fly to confirm the change, in the order that keeps each "
+                    "flight answerable on its own."
+                ),
+            )
+        )
 
+        # The shell already wraps every stage in a scroll area; a second one here
+        # would fight it for the wheel.
         self._body = QWidget()
         self._items = QVBoxLayout(self._body)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._body)
-        layout.addWidget(scroll, 1)
+        self._items.setContentsMargins(0, 0, 0, 0)
+        self._items.setSpacing(12)
+        layout.addWidget(self._body, 1)
 
         state.analysis_finished.connect(lambda *_: self.refresh())
 
     def refresh(self) -> None:
-        while self._items.count():
-            item = self._items.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._items)
 
         result = self.state.result
         plan = result.session.next_steps if result is not None else None
@@ -101,6 +110,9 @@ def _card(text: str, title: str) -> QWidget:
     layout = QVBoxLayout(frame)
     heading = QLabel(title)
     heading.setObjectName("Heading")
+    # Card headings are prose. Unwrapped, a title like "Flight 2: Rate loop I and
+    # feed-forward" sets a minimum width the page can never give back.
+    heading.setWordWrap(True)
     layout.addWidget(heading)
     layout.addWidget(_wrapped(text))
     return frame

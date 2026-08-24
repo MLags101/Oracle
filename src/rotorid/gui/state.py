@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, QThreadPool, Signal
+from PySide6.QtCore import QObject, QThreadPool, QTimer, Signal
 
 from rotorid import __version__
 from rotorid.config import Config, load_config
@@ -25,7 +25,7 @@ from rotorid.core.logkind import Capabilities, capabilities
 from rotorid.core.types import AXES, Axis, Finding, LogBundle, LogKind
 from rotorid.gui.workers import Job
 
-__all__ = ["STAGES", "AppState", "Stage"]
+__all__ = ["STAGES", "STAGE_BLURBS", "AppState", "Stage"]
 
 #: The wizard's stages, in order. The rail draws them from this and the gating
 #: rules below are expressed against it, so adding a stage is one edit.
@@ -41,6 +41,25 @@ STAGES: tuple[Stage, ...] = (
     "Next Flight",
     "Validate",
 )
+
+#: What each stage is for, in the few words the rail has room for.
+#:
+#: These live here rather than on the stage classes because the rail has to draw
+#: a step before its widget has anything to say -- and because a user deciding
+#: whether "Segment" is worth clicking is exactly the user whose stage has not
+#: been built yet. Five words next to the name is the whole difference between a
+#: sequence somebody can follow and a menu of jargon.
+STAGE_BLURBS: dict[Stage, str] = {
+    "Load": "Open a log, check it can be used",
+    "Health & Noise": "What the gyro is actually hearing",
+    "Segment": "Which parts of the flight to trust",
+    "Identify": "The airframe recovered from them",
+    "Filters": "Notches and low-passes, and their cost",
+    "Design": "Gains designed against that airframe",
+    "Review & Export": "Read the changes, write the file",
+    "Next Flight": "What to fly to confirm it",
+    "Validate": "Check a second flight against this",
+}
 
 
 class AppState(QObject):
@@ -76,6 +95,11 @@ class AppState(QObject):
         #: cannot disagree about it.
         self.declared_kind: LogKind | None = None
         self.conservatism = 0.5
+        #: Whether opening a log is itself a request to analyse it. On by
+        #: default: see :meth:`_auto_analyse`. Held here rather than in the
+        #: window so the preference survives a log being reloaded by a change of
+        #: declared kind, which goes through the same path.
+        self.auto_analyse = True
         self.acknowledgements: dict[str, str] = {}
         #: The second flight, for validation mode. Held beside the analysis
         #: rather than replacing it: the whole point of the screen is that both
@@ -141,6 +165,28 @@ class AppState(QObject):
         assert isinstance(bundle, LogBundle)
         self.bundle = bundle
         self.log_loaded.emit(bundle)
+        # Next turn of the event loop, not now: this is running inside the load
+        # job's ``finished`` signal, and starting the next job from in there
+        # would have the load job's own retirement land on the analysis.
+        QTimer.singleShot(0, self._auto_analyse)
+
+    def _auto_analyse(self) -> None:
+        """Analyse a freshly opened log without being asked (spec section 10.2).
+
+        The tool's answer to "what is wrong with this log" costs a couple of
+        minutes of compute and nothing of the user's attention, so making them
+        find a menu item to ask for it buys nothing and loses the users who never
+        find it. Opening a log *is* the request.
+
+        Every guard here is a case where running would be wrong rather than
+        merely redundant: no log, an analysis already asked for by hand, one
+        already finished, or the preference turned off.
+        """
+        if not self.auto_analyse or self.bundle is None:
+            return
+        if self.busy or self.result is not None:
+            return
+        self.run_analysis()
 
     # ----------------------------------------------------------------- #
     # Validation (spec 5.10)
@@ -307,6 +353,22 @@ class AppState(QObject):
             return True
         return self.result is not None and bool(self.result.session.recommendations)
 
+    def stage_block_reason(self, stage: Stage) -> str:
+        """Why a stage is shut, in words the user can act on. Empty when it is open.
+
+        "Needs a log" and "needs the analysis" are different problems with
+        different fixes. Collapsing both into "not yet" -- which is what the rail
+        used to say -- leaves the user to guess which of the two they have, and
+        the guess they usually make is that the program is broken.
+        """
+        if self.stage_ready(stage):
+            return ""
+        if self.bundle is None:
+            return "Open a log first"
+        if self.result is None:
+            return "Runs with the analysis"
+        return "Nothing could be identified in this log"
+
     # ----------------------------------------------------------------- #
     # Plumbing
     # ----------------------------------------------------------------- #
@@ -338,11 +400,21 @@ class AppState(QObject):
         if on_cancelled is not None:
             job.signals.cancelled.connect(on_cancelled)
         for signal in (job.signals.finished, job.signals.failed, job.signals.cancelled):
-            signal.connect(self._job_done)
+            signal.connect(lambda *_, j=job: self._job_done(j))
 
         self.busy_changed.emit(True)
         self._pool.start(job)
 
-    def _job_done(self, *_: object) -> None:
+    def _job_done(self, job: Job) -> None:
+        """Retire a job, but only if it is still the one in flight.
+
+        A cancelled job finishes whenever it next gets round to polling, which
+        can be after its replacement has already started. Clearing the slot
+        unconditionally -- which is what this used to do -- would then leave the
+        replacement untracked: Cancel would do nothing to it, and the window
+        would go un-busy while an analysis was still running.
+        """
+        if self._job is not job:
+            return
         self._job = None
         self.busy_changed.emit(False)

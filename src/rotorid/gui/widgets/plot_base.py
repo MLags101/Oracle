@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from rotorid.gui.theme import SERIES, Palette, palette
+from rotorid.gui.widgets.log_axis import LogAxis
 
 __all__ = ["PlotCard", "pen"]
 
@@ -80,8 +81,14 @@ class PlotCard(QWidget):
         header = QHBoxLayout()
         heading = QLabel(title)
         heading.setObjectName("Heading")
-        header.addWidget(heading)
-        header.addStretch(1)
+        # Wrapped so the card can be narrow. An unwrapped title plus the explain
+        # button gives every plot a floor of some 560 pixels, and a stage holding
+        # two of them side by side then cannot fit in a 1200-pixel window with
+        # the findings dock open.
+        heading.setWordWrap(True)
+        # The heading takes the slack, so the readout and the explain button stay
+        # against the right edge without a spacer competing for the same room.
+        header.addWidget(heading, 1)
         self.readout = QLabel("")
         self.readout.setObjectName("Muted")
         header.addWidget(self.readout)
@@ -90,7 +97,11 @@ class PlotCard(QWidget):
         header.addWidget(explain)
         layout.addLayout(header)
 
-        self.plot = pg.PlotWidget()
+        # A log axis gets ours, which spaces its labels and writes them in Hz.
+        # pyqtgraph's own draws every mantissa in every decade as one tick level
+        # and its anti-crowding rule exempts the first level, so the labels land
+        # on top of each other. See :mod:`rotorid.gui.widgets.log_axis`.
+        self.plot = pg.PlotWidget(axisItems={"bottom": LogAxis("bottom")} if log_x else None)
         self.plot.setLogMode(x=log_x, y=False)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", x_label, units=x_units or None)

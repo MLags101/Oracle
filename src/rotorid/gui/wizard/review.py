@@ -18,15 +18,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -34,8 +31,10 @@ from PySide6.QtWidgets import (
 from rotorid import __version__
 from rotorid.core.types import FlightTestStage
 from rotorid.gui.state import AppState
-from rotorid.gui.theme import severity_colour
+from rotorid.gui.theme import Palette, severity_colour
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.widgets.param_diff_table import ParamDiffTable
+from rotorid.gui.widgets.responsive import FlowLayout
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["ReviewStage"]
@@ -46,14 +45,24 @@ class ReviewStage(StageWidget):
 
     title = "Review & Export"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
 
-        layout = QVBoxLayout(self)
-
-        heading = QLabel("Review and export")
-        heading.setObjectName("Heading")
-        layout.addWidget(heading)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Review & Export",
+                subtitle=(
+                    "Every change the analysis is proposing, staged in the order it is "
+                    "safe to fly, and the files that record it."
+                ),
+            )
+        )
 
         self._safety = QLabel(
             "RotorID never writes to a vehicle. These buttons write files that you "
@@ -61,14 +70,19 @@ class ReviewStage(StageWidget):
             "flight, and download the log after each one."
         )
         self._safety.setWordWrap(True)
+        self.banner(self._safety, "info")
         layout.addWidget(self._safety)
 
         self._gate = QLabel("")
         self._gate.setWordWrap(True)
         layout.addWidget(self._gate)
 
-        buttons = QHBoxLayout()
+        # Wrapping, not a fixed row: three buttons with names this long give the
+        # page a floor of about a thousand pixels, which is more than a 1200-wide
+        # window has left once the rail and the findings dock have taken theirs.
+        buttons = FlowLayout(spacing=10)
         self._export_button = QPushButton("Export staged .param files...")
+        self._export_button.setObjectName("Primary")
         self._export_button.clicked.connect(self._export_params)
         self._report_button = QPushButton("Write HTML report...")
         self._report_button.clicked.connect(self._export_report)
@@ -76,16 +90,16 @@ class ReviewStage(StageWidget):
         self._session_button.clicked.connect(self._save_session)
         for button in (self._export_button, self._report_button, self._session_button):
             buttons.addWidget(button)
-        buttons.addStretch(1)
         layout.addLayout(buttons)
 
+        # No scroll area of its own: the shell wraps every stage in one, and
+        # a scroll region inside a scroll region swallows the wheel wherever the
+        # pointer happens to be sitting.
         self._body = QWidget()
         self._stages = QVBoxLayout(self._body)
-        self._stages.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self._body)
-        layout.addWidget(scroll, 1)
+        self._stages.setContentsMargins(0, 0, 0, 0)
+        self._stages.setSpacing(12)
+        layout.addWidget(self._body, 1)
 
         state.analysis_finished.connect(lambda *_: self.refresh())
         state.acknowledgements_changed.connect(self.refresh)
@@ -95,11 +109,7 @@ class ReviewStage(StageWidget):
     # ----------------------------------------------------------------- #
 
     def refresh(self) -> None:
-        while self._stages.count():
-            item = self._stages.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._stages)
 
         result = self.state.result
         plan = result.session.next_steps if result is not None else None
@@ -112,6 +122,7 @@ class ReviewStage(StageWidget):
                     "this log supports a change worth flying for."
                 )
             )
+            self._stages.addStretch(1)
             return
 
         preamble = QLabel(plan.preamble)
@@ -119,6 +130,10 @@ class ReviewStage(StageWidget):
         self._stages.addWidget(preamble)
         for stage in plan.stages:
             self._stages.addWidget(self._card(stage))
+        # A trailing stretch rather than the layout's alignment flag: an aligned
+        # layout is sized to its size hint, and a size hint cannot say "this tall
+        # at this width", so cards of wrapped text come out clipped.
+        self._stages.addStretch(1)
 
     def _card(self, stage: FlightTestStage) -> QWidget:
         card = QFrame()
@@ -127,6 +142,8 @@ class ReviewStage(StageWidget):
 
         title = QLabel(f"Flight {stage.index}: {stage.title}")
         title.setObjectName("Heading")
+
+        title.setWordWrap(True)
         layout.addWidget(title)
 
         if stage.motivating_findings:
@@ -135,7 +152,6 @@ class ReviewStage(StageWidget):
         table = ParamDiffTable()
         flown = self.state.bundle.params if self.state.bundle is not None else {}
         table.show_diff(stage.changes, flown)
-        table.setMaximumHeight(38 * (len(stage.changes) + 1) + 8)
         layout.addWidget(table)
 
         for label, items in (

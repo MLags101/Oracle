@@ -71,12 +71,25 @@ still name the file up front if you prefer:
 rotorid gui flight.bin
 ```
 
+**Dropping a log in analyses it.** You do not have to ask twice: opening a file
+starts the run, and a couple of minutes later the findings panel says what is
+wrong with the flight and what to do about it. The toolbar's **Analyse** button
+is for re-running after you have moved the conservatism slider, and the
+**Analyse on open** switch beside it turns the automatic run off for anyone who
+would rather look at the log first.
+
 Nine stages, in the order the analysis actually depends on: **Load**, **Health &
 Noise**, **Segment**, **Identify**, **Filters**, **Design**, **Review & Export**,
 **Next Flight**, **Validate**. Health comes before Identify because a model fitted
 to a shaking frame is not a weak model, it is confident nonsense. Validate comes
 last because it is what you do when you come back with the flight the previous
 stage told you to fly.
+
+The rail down the left is that order, drawn as one numbered sequence rather than
+nine names. Each step says what it is for in a few words, ticks off once you have
+been there, and — when it is not open yet — says what would open it. "Open a log
+first" and "nothing could be identified in this log" are different problems with
+different fixes, and the rail names which one you have.
 
 The Filters and Design stages are a live sandbox. Move a control and the margins, the
 predicted step, the predicted spectrum and the phase budget all move together, so the

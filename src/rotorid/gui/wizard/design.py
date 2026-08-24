@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -39,9 +38,11 @@ from rotorid.core.design.controller import controller_for
 from rotorid.core.design.recommend import recommend_from
 from rotorid.core.types import Axis, TuneRecommendation
 from rotorid.gui.state import AppState
-from rotorid.gui.theme import severity_colour
+from rotorid.gui.theme import Palette, severity_colour
 from rotorid.gui.widgets.bode_plot import BodePlot
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.widgets.phase_budget_plot import PhaseBudgetPlot
+from rotorid.gui.widgets.responsive import FlowLayout, ResponsiveSplitter
 from rotorid.gui.widgets.step_response_plot import StepResponsePlot
 from rotorid.gui.widgets.why_popover import why_button
 from rotorid.gui.wizard.base import StageWidget
@@ -81,8 +82,13 @@ class DesignStage(StageWidget):
 
     title = "Design"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
         self._axis: Axis | None = None
         self._live: TuneRecommendation | None = None
 
@@ -91,11 +97,25 @@ class DesignStage(StageWidget):
         self._debounce.setInterval(_DEBOUNCE_MS)
         self._debounce.timeout.connect(self._resolve)
 
-        layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._controls())
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Design",
+                subtitle=(
+                    "Gains designed against the identified airframe, with the phase the "
+                    "filters already spent subtracted from the margin available."
+                ),
+            )
+        )
+
+        splitter = ResponsiveSplitter(threshold=760, sizes=(360, 900))
+        controls = self._controls()
+        # A floor, not a preference. Without one the splitter happily squeezes
+        # this column until the gain table reads "Curren" and every explain
+        # button is a single clipped letter.
+        controls.setMinimumWidth(330)
+        splitter.addWidget(controls)
         splitter.addWidget(self._plots())
-        splitter.setSizes((360, 900))
         layout.addWidget(splitter, 1)
 
         state.analysis_finished.connect(lambda *_: self.refresh())
@@ -108,7 +128,7 @@ class DesignStage(StageWidget):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        self._axis_row = QHBoxLayout()
+        self._axis_row = FlowLayout(spacing=6)
         layout.addLayout(self._axis_row)
 
         heading = QLabel("Conservatism")
@@ -173,9 +193,9 @@ class DesignStage(StageWidget):
     def _plots(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        self._step = StepResponsePlot()
-        self._bode = BodePlot()
-        self._budget = PhaseBudgetPlot()
+        self._step = StepResponsePlot(theme=self.theme)
+        self._bode = BodePlot(theme=self.theme)
+        self._budget = PhaseBudgetPlot(theme=self.theme)
         layout.addWidget(self._step, 2)
         layout.addWidget(self._bode, 3)
         layout.addWidget(self._budget, 1)
@@ -260,11 +280,7 @@ class DesignStage(StageWidget):
             )
 
     def _rebuild_axis_row(self, axes: tuple[Axis, ...]) -> None:
-        while self._axis_row.count():
-            item = self._axis_row.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._axis_row)
         for axis in axes:
             button = QPushButton(axis.title())
             button.setCheckable(True)
@@ -345,10 +361,11 @@ class DesignStage(StageWidget):
 
     def _draw_margins(self, rec: TuneRecommendation) -> None:
         _clear_grid(self._margins)
+        self._margins.setColumnStretch(0, 1)
         for row, (label, field, units) in enumerate(_MARGIN_ROWS):
             value = float(getattr(rec.margins, field))
             self._margins.addWidget(_muted(label), row, 0)
-            self._margins.addWidget(QLabel(f"{value:.2f} {units}"), row, 1)
+            self._margins.addWidget(_wrapped(f"{value:.2f} {units}"), row, 1)
             key = {
                 "phase_margin_deg": "phase_margin",
                 "gain_margin_db": "gain_margin",
@@ -362,7 +379,7 @@ class DesignStage(StageWidget):
 
         row = len(_MARGIN_ROWS)
         self._margins.addWidget(_muted("D-term noise"), row, 0)
-        self._margins.addWidget(QLabel(f"{rec.dterm_noise_rms_pct:.2f} % of full output"), row, 1)
+        self._margins.addWidget(_wrapped(f"{rec.dterm_noise_rms_pct:.2f} % of full output"), row, 1)
         noise_why = why_button("dterm_noise", rec, self)
         if noise_why is not None:
             self._margins.addWidget(noise_why, row, 2)
@@ -374,14 +391,22 @@ class DesignStage(StageWidget):
 
 
 def _clear_grid(grid: QGridLayout) -> None:
-    while grid.count():
-        item = grid.takeAt(0)
-        widget = item.widget() if item is not None else None
-        if widget is not None:
-            widget.deleteLater()
+    clear(grid)
+
+
+def _wrapped(text: str) -> QLabel:
+    """A value label that can give ground horizontally. See :func:`_muted`."""
+    label = QLabel(text)
+    label.setWordWrap(True)
+    return label
 
 
 def _muted(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("Muted")
+    # Wrapped, so a row label like "Disturbance-rejection bandwidth" can give
+    # ground. Unwrapped it sets a minimum width for its grid, its card, its
+    # column and finally the whole stage, and the stage answers by growing a
+    # horizontal scrollbar.
+    label.setWordWrap(True)
     return label

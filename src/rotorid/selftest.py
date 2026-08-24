@@ -227,7 +227,6 @@ def _walk_the_wizard(result: Result, analysis: Any) -> None:
 
         from rotorid.gui.main_window import MainWindow
         from rotorid.gui.state import STAGES, AppState
-        from rotorid.gui.wizard.base import StageWidget
 
         app = QApplication.instance() or QApplication([])
         # Set directly rather than run through the worker threads. What is being
@@ -238,11 +237,13 @@ def _walk_the_wizard(result: Result, analysis: Any) -> None:
         state.result = analysis
         window = MainWindow(state)
         window.show()
+        # Ask the window which stage is current rather than reading the widget
+        # out of the stack: stages are wrapped in a scroll area, and a check that
+        # quietly skipped anything it did not recognise would report success
+        # having drawn nothing at all.
         for row in range(len(STAGES)):
             window.rail.setCurrentRow(row)
-            stage = window.work.currentWidget()
-            if isinstance(stage, StageWidget):
-                stage.refresh()
+            window.current_stage().refresh()
         app.processEvents()
     except Exception as exc:
         result.add(

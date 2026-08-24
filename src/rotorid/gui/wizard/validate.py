@@ -25,15 +25,17 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
-    QVBoxLayout,
+    QWidget,
 )
 
 from rotorid.core.analysis.compare import AxisComparison, ValidationReport
 from rotorid.core.guidance.validation import validation_findings
 from rotorid.core.types import LogBundle
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
 from rotorid.gui.widgets.findings_panel import FindingsPanel
 from rotorid.gui.widgets.plot_base import PlotCard, pen
+from rotorid.gui.widgets.responsive import ResponsiveRow
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["ValidateStage"]
@@ -63,14 +65,22 @@ _SPECTRUM_EXPLANATION = (
 class ValidateStage(StageWidget):
     title = "Validate"
 
-    def __init__(self, state: AppState, parent: object = None) -> None:
-        super().__init__(state)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
         self.setAcceptDrops(True)
 
-        layout = QVBoxLayout(self)
-        heading = QLabel("Did it do what it said it would?")
-        heading.setObjectName("Heading")
-        layout.addWidget(heading)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Validate",
+                subtitle="Did it do what it said it would? Open a second flight to find out.",
+            )
+        )
 
         self._scope = QLabel()
         self._scope.setObjectName("Muted")
@@ -79,19 +89,27 @@ class ValidateStage(StageWidget):
 
         row = QHBoxLayout()
         self._choose = QPushButton("Choose the after-flight log...")
+        self._choose.setObjectName("Primary")
         self._choose.clicked.connect(self.open_after_dialog)
         row.addWidget(self._choose)
         self._status = QLabel("No second log loaded.")
         self._status.setObjectName("Muted")
+        self._status.setWordWrap(True)
         row.addWidget(self._status, 1)
         layout.addLayout(row)
 
         self._table = QTreeWidget()
         self._table.setColumnCount(4)
         self._table.setHeaderLabels(("Quantity", "Before", "After", "Predicted"))
+        self._table.setRootIsDecorated(False)
+        self._table.setAlternatingRowColors(True)
+        self._table.setMinimumHeight(180)
         layout.addWidget(self._table)
 
-        plots = QHBoxLayout()
+        # Side by side when the window can hold two plots, stacked when it
+        # cannot. Two plot cards in a fixed row give this page a floor wider than
+        # a 1200-pixel window has left with the findings dock open.
+        plots = ResponsiveRow(threshold=820)
         self._steps = PlotCard(
             "Step response, measured",
             _STEP_EXPLANATION,
@@ -100,18 +118,23 @@ class ValidateStage(StageWidget):
             y_label="Rate",
             y_units="rad/s",
             log_x=False,
+            theme=self.theme,
         )
         self._spectra = PlotCard(
             "Post-filter gyro noise",
             _SPECTRUM_EXPLANATION,
             y_label="PSD",
             y_units="dB",
+            theme=self.theme,
         )
-        plots.addWidget(self._steps, 1)
-        plots.addWidget(self._spectra, 1)
-        layout.addLayout(plots, 1)
+        for plot in (self._steps, self._spectra):
+            plot.setMinimumHeight(280)
+        plots.add(self._steps)
+        plots.add(self._spectra)
+        layout.addWidget(plots, 1)
 
-        self._findings = FindingsPanel()
+        self._findings = FindingsPanel(self.theme)
+        self._findings.setMinimumHeight(200)
         layout.addWidget(self._findings, 1)
 
         state.after_loaded.connect(self._on_after)

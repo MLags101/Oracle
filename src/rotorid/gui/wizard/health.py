@@ -21,13 +21,15 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
 from rotorid.core.types import Axis, Finding, SpectralPeak
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.widgets.prepost_spectrum import PrePostSpectrumPlot
+from rotorid.gui.widgets.responsive import FlowLayout
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["HealthStage"]
@@ -43,13 +45,6 @@ _GATING_CODES = (
     "VIBRATION_LOW",
     "VIBRATION_NOT_LOGGED",
 )
-
-_GATE_STYLE = {
-    "blocker": "background:#7a1f1f; color:#ffffff; padding:8px; border-radius:4px;",
-    "warning": "background:#7a5b1f; color:#ffffff; padding:8px; border-radius:4px;",
-    "good": "background:#1f5a2e; color:#ffffff; padding:8px; border-radius:4px;",
-    "info": "background:#33383f; color:#ffffff; padding:8px; border-radius:4px;",
-}
 
 _KINDS = {
     "motor_fundamental": (
@@ -78,13 +73,35 @@ class HealthStage(StageWidget):
 
     title = "Health & Noise"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
         self._axis: Axis | None = None
 
-        layout = QVBoxLayout(self)
-        self._axis_row = QHBoxLayout()
-        layout.addLayout(self._axis_row)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Health & Noise",
+                subtitle=(
+                    "What the gyro is hearing, before anything is identified from it. "
+                    "A model fitted to a shaking frame fits beautifully and describes "
+                    "something that is not the aircraft."
+                ),
+            )
+        )
+
+        self._axis_row = FlowLayout(spacing=6)
+        axis_row = QHBoxLayout()
+        axis_label = QLabel("Axis")
+        axis_label.setObjectName("Eyebrow")
+        axis_row.addWidget(axis_label)
+        axis_row.addLayout(self._axis_row)
+        axis_row.addStretch(1)
+        layout.addLayout(axis_row)
 
         # Above the spectrum, deliberately. If the frame is shaking or the
         # accelerometers are clipping, nothing further down this page is a
@@ -102,7 +119,8 @@ class HealthStage(StageWidget):
         self._summary.setWordWrap(True)
         layout.addWidget(self._summary)
 
-        self._spectrum = PrePostSpectrumPlot()
+        self._spectrum = PrePostSpectrumPlot(theme=self.theme)
+        self._spectrum.setMinimumHeight(300)
         layout.addWidget(self._spectrum, 3)
 
         self._peaks = QTableWidget(0, 5)
@@ -111,6 +129,10 @@ class HealthStage(StageWidget):
         )
         self._peaks.verticalHeader().setVisible(False)
         self._peaks.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._peaks.setAlternatingRowColors(True)
+        self._peaks.setWordWrap(True)
+        self._peaks.setMinimumHeight(160)
+        self._peaks.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._peaks, 2)
 
         state.analysis_finished.connect(lambda *_: self.refresh())
@@ -152,7 +174,7 @@ class HealthStage(StageWidget):
             self._gate.setVisible(False)
             return
         worst = found[0]
-        self._gate.setStyleSheet(_GATE_STYLE.get(worst.severity, ""))
+        self.banner(self._gate, worst.severity)
         self._gate.setText("\n\n".join(f"{f.title}\n{f.detail} {f.action}".strip() for f in found))
         self._gate.setVisible(True)
 
@@ -169,11 +191,7 @@ class HealthStage(StageWidget):
         }.get(source, "not available in this log.")
 
     def _rebuild_axis_row(self, axes: tuple[Axis, ...]) -> None:
-        while self._axis_row.count():
-            item = self._axis_row.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._axis_row)
         for axis in axes:
             button = QPushButton(axis.title())
             button.setCheckable(True)

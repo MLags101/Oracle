@@ -17,12 +17,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QTableWidget,
     QTableWidgetItem,
-    QVBoxLayout,
     QWidget,
 )
 
 from rotorid.core.types import ExcitationSegment, LogBundle
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
 from rotorid.gui.widgets.plot_base import PlotCard, pen
 from rotorid.gui.wizard.base import StageWidget
 
@@ -45,10 +45,25 @@ class SegmentStage(StageWidget):
 
     title = "Segment"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
 
-        layout = QVBoxLayout(self)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Segment",
+                subtitle=(
+                    "Which stretches of the flight can support an identification, and "
+                    "which are the aircraft being flown rather than being measured."
+                ),
+            )
+        )
+
         self._summary = QLabel("")
         self._summary.setWordWrap(True)
         layout.addWidget(self._summary)
@@ -61,13 +76,18 @@ class SegmentStage(StageWidget):
             y_label="Rate",
             y_units="rad/s",
             log_x=False,
+            theme=self.theme,
         )
+        self._trace.setMinimumHeight(300)
         layout.addWidget(self._trace, 3)
 
         self._table = QTableWidget(0, 5)
         self._table.setHorizontalHeaderLabels(("Axis", "Kind", "Start", "End", "Confidence"))
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setMinimumHeight(150)
+        self._table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._table, 1)
 
         state.log_loaded.connect(lambda *_: self.refresh())

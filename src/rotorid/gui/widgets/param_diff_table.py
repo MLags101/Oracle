@@ -10,7 +10,7 @@ user should be doing before loading anything.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QHeaderView, QTableWidget, QTableWidgetItem, QWidget
 
 __all__ = ["ParamDiffTable"]
 
@@ -22,6 +22,17 @@ class ParamDiffTable(QTableWidget):
         self.verticalHeader().setVisible(False)
         self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.setAlternatingRowColors(True)
+        # Resize modes rather than a call to ``resizeColumnsToContents``. That
+        # call measures once, at a moment when the table may not yet have been
+        # laid out, and leaves ``ATC_RAT_RLL_D`` reading ``ATC_RAT_...`` next to
+        # 300 pixels of empty table. Modes are re-evaluated whenever anything
+        # changes, so the parameter name gets the width it needs and the three
+        # numeric columns share what is left.
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for column in (1, 2, 3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
 
     def show_diff(self, proposed: dict[str, float], flown: dict[str, float]) -> None:
         self.setRowCount(len(proposed))
@@ -37,7 +48,7 @@ class ParamDiffTable(QTableWidget):
                 item.setForeground(Qt.GlobalColor.darkYellow)
                 item.setToolTip("This value is being asked to change.")
             self.setItem(row, 3, item)
-        self.resizeColumnsToContents()
+        self.fit_to_rows()
 
     def show_nothing(self, why: str) -> None:
         """No proposal is a result, and it needs to say why rather than be blank."""
@@ -46,7 +57,22 @@ class ParamDiffTable(QTableWidget):
         item = _cell(why)
         item.setForeground(Qt.GlobalColor.darkGray)
         self.setItem(0, 0, item)
-        self.resizeColumnsToContents()
+        self.fit_to_rows()
+
+    def fit_to_rows(self) -> None:
+        """Take exactly the height of the rows in it.
+
+        These tables sit inside cards on a page that scrolls. A table with its
+        own scrollbar there would hide half of a two-row diff behind a control
+        the user has no reason to expect, on the one screen where seeing every
+        proposed change at once is the entire point.
+        """
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        rows = self.rowCount()
+        height = self.horizontalHeader().height() + 2 * self.frameWidth()
+        for row in range(rows):
+            height += self.rowHeight(row)
+        self.setFixedHeight(height)
 
 
 def _cell(text: str) -> QTableWidgetItem:

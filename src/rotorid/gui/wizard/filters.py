@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -37,9 +36,12 @@ from rotorid.core.design.recommend import recommend_from
 from rotorid.core.filters.chain import FilterChain
 from rotorid.core.types import Axis, SpectralPeak, TuneRecommendation
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.widgets.param_diff_table import ParamDiffTable
 from rotorid.gui.widgets.phase_budget_plot import PhaseBudgetPlot
 from rotorid.gui.widgets.prepost_spectrum import PrePostSpectrumPlot
+from rotorid.gui.widgets.responsive import FlowLayout, ResponsiveSplitter
 from rotorid.gui.widgets.why_popover import why_button
 from rotorid.gui.wizard.base import StageWidget
 
@@ -59,8 +61,13 @@ class FiltersStage(StageWidget):
 
     title = "Filters"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
         self._axis: Axis | None = None
         self._live: TuneRecommendation | None = None
         self._loading = False
@@ -70,11 +77,25 @@ class FiltersStage(StageWidget):
         self._debounce.setInterval(_DEBOUNCE_MS)
         self._debounce.timeout.connect(self._resolve)
 
-        layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._controls())
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Filters",
+                subtitle=(
+                    "What to notch and what to low-pass, and what each one costs in "
+                    "phase at the frequency the gains have to work at."
+                ),
+            )
+        )
+
+        splitter = ResponsiveSplitter(threshold=780, sizes=(380, 900))
+        controls = self._controls()
+        # A floor, not a preference. Without one the splitter happily squeezes
+        # this column until the gain table reads "Curren" and every explain
+        # button is a single clipped letter.
+        controls.setMinimumWidth(340)
+        splitter.addWidget(controls)
         splitter.addWidget(self._panels())
-        splitter.setSizes((380, 900))
         layout.addWidget(splitter, 1)
 
         state.analysis_finished.connect(lambda *_: self.refresh())
@@ -87,7 +108,7 @@ class FiltersStage(StageWidget):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        self._axis_row = QHBoxLayout()
+        self._axis_row = FlowLayout(spacing=6)
         layout.addLayout(self._axis_row)
 
         card = QFrame()
@@ -137,7 +158,7 @@ class FiltersStage(StageWidget):
         self._verdict.setWordWrap(True)
         layout.addWidget(self._verdict)
 
-        self._why_row = QHBoxLayout()
+        self._why_row = FlowLayout(spacing=6)
         layout.addLayout(self._why_row)
 
         self._diff = ParamDiffTable()
@@ -147,8 +168,8 @@ class FiltersStage(StageWidget):
     def _panels(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        self._spectrum = PrePostSpectrumPlot()
-        self._budget = PhaseBudgetPlot()
+        self._spectrum = PrePostSpectrumPlot(theme=self.theme)
+        self._budget = PhaseBudgetPlot(theme=self.theme)
         layout.addWidget(self._spectrum, 3)
         layout.addWidget(self._budget, 1)
         return panel
@@ -228,11 +249,7 @@ class FiltersStage(StageWidget):
         self._draw()
 
     def _rebuild_axis_row(self, axes: tuple[Axis, ...]) -> None:
-        while self._axis_row.count():
-            item = self._axis_row.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._axis_row)
         for axis in axes:
             button = QPushButton(axis.title())
             button.setCheckable(True)
@@ -307,11 +324,7 @@ class FiltersStage(StageWidget):
         self._rebuild_why_row(rec)
 
     def _rebuild_why_row(self, rec: TuneRecommendation) -> None:
-        while self._why_row.count():
-            item = self._why_row.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._why_row)
         for key, label in (
             ("INS_GYRO_FILTER", "gyro low-pass"),
             ("INS_HNTCH_FREQ", "notch frequency"),

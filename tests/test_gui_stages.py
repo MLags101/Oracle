@@ -54,12 +54,160 @@ def test_every_stage_in_the_rail_draws_without_raising(window) -> None:
     for row, name in enumerate(STAGES):
         window.rail.setCurrentRow(row)
         assert window.work.currentIndex() == row, name
-        window.work.currentWidget().refresh()
+        window.current_stage().refresh()
 
 
 def test_every_stage_is_reachable_once_the_analysis_has_run(window) -> None:
     assert all(window.state.stage_ready(name) for name in STAGES)
-    assert all("not yet" not in window.rail.item(row).text() for row in range(len(STAGES)))
+    assert all(window.rail.step(row).open for row in range(len(STAGES)))
+
+
+# --------------------------------------------------------------------------- #
+# Content that does not fit
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stage_taller_than_the_window_can_be_scrolled_to(window) -> None:
+    """The failure this replaced was silent, which is what made it expensive.
+
+    Qt cannot ask a wrapped label how tall it is without being told how wide it
+    will be, so a page of paragraphs reports a minimum height of a few lines,
+    the scroll area believes it, and the text is drawn clipped with no scrollbar
+    to suggest there is more. The user concludes the rest is not there.
+    """
+    window.resize(1100, 700)
+    row = STAGES.index("Review & Export")
+    window.rail.setCurrentRow(row)
+    _settle(window)
+
+    page = window._scrollers[row]
+    stage = window.current_stage()
+    assert stage.height() > page.viewport().height(), "this page really is taller than the window"
+    assert page.verticalScrollBar().maximum() > 0, "and it can be scrolled to the rest of it"
+
+
+def test_a_stage_that_fits_gets_no_scrollbar(window) -> None:
+    """Nothing gains a scrollbar it does not need."""
+    window.resize(1600, 1400)
+    window.rail.setCurrentRow(0)
+    _settle(window)
+
+    page = window._scrollers[0]
+    assert page.verticalScrollBar().maximum() == 0
+
+
+def test_no_stage_scrolls_sideways(window) -> None:
+    """A horizontal scrollbar on a text page means something refused to wrap."""
+    window.resize(1200, 900)
+    for row in range(len(STAGES)):
+        window.rail.setCurrentRow(row)
+        _settle(window)
+        page = window._scrollers[row]
+        assert page.horizontalScrollBar().maximum() == 0, STAGES[row]
+
+
+def test_no_wrapped_text_is_drawn_clipped(window) -> None:
+    """Every label gets at least the height its own width implies.
+
+    This is the bug that made the tool look broken rather than look plain: a
+    finding whose fourth line was sliced through by the paragraph after it. It
+    had three independent causes -- a container Qt would not ask about height, a
+    panel measured at the wrong width, and a layout top-aligned with the
+    alignment flag instead of a stretch -- so it is asserted directly rather than
+    through any one of them.
+    """
+    from PySide6.QtWidgets import QLabel
+
+    window.resize(1280, 860)
+    clipped: list[str] = []
+    for row in range(len(STAGES)):
+        window.rail.setCurrentRow(row)
+        _settle(window)
+        for widget in (window.current_stage(), window.findings):
+            for label in widget.findChildren(QLabel):
+                if not label.wordWrap() or not label.isVisible() or not label.text():
+                    continue
+                needed = label.heightForWidth(label.width())
+                if needed > 0 and label.height() < needed:
+                    clipped.append(f"{STAGES[row]}: {label.text()[:60]!r}")
+
+    assert not clipped, "text drawn in a box too short for it:\n" + "\n".join(clipped)
+
+
+def _settle(window) -> None:
+    """Let the layout run.
+
+    Shown, because an unshown window has nominal geometry and the whole question
+    here is what happens at a real size. Several passes, because sizing a page to
+    its content is answered over more than one: the height depends on the width,
+    which depends on whether a scrollbar appeared.
+    """
+    from PySide6.QtWidgets import QApplication
+
+    window.show()
+    for _ in range(6):
+        QApplication.processEvents()
+
+
+# --------------------------------------------------------------------------- #
+# Themes
+# --------------------------------------------------------------------------- #
+
+
+def test_switching_theme_repaints_the_plots_too(window) -> None:
+    """Half a theme is worse than one theme.
+
+    Restyling the chrome and leaving nine pyqtgraph canvases on the old
+    background is the version of this that looks broken, so the stages are
+    rebuilt -- which is only affordable because a stage holds no analysis of its
+    own and a new one drawn from the same state shows the same numbers.
+    """
+    window.rail.setCurrentRow(STAGES.index("Design"))
+    before = window.design_stage
+
+    window.apply_theme("dark")
+
+    assert window.palette_.mode == "dark"
+    assert window.design_stage is not before, "a rebuilt stage, not the old one restyled"
+    assert window.design_stage.theme.mode == "dark"
+    assert window.work.currentIndex() == STAGES.index("Design"), "and you stay where you were"
+    window.current_stage().refresh()
+
+
+def test_severity_banners_come_from_the_palette_in_force(window) -> None:
+    """A hard-coded dark banner is unreadable the moment somebody opens light mode."""
+    from PySide6.QtWidgets import QLabel
+
+    light_label = QLabel("shaking")
+    window.health_stage.banner(light_label, "blocker")
+    light = light_label.styleSheet()
+
+    window.apply_theme("dark")
+    dark_label = QLabel("shaking")
+    window.health_stage.banner(dark_label, "blocker")
+    dark = dark_label.styleSheet()
+
+    assert light != dark
+    assert all("#" in style for style in (light, dark))
+
+
+def test_a_banner_is_measured_with_the_room_it_takes(window) -> None:
+    """Padding is contents margins, not CSS, or the last line is drawn off the box.
+
+    Qt sizes wrapped text from the layout's geometry and applies stylesheet
+    padding only when painting, so a banner padded in CSS reports a height it
+    then overruns.
+    """
+    from PySide6.QtWidgets import QLabel
+
+    label = QLabel("a long finding that will wrap more than once at any sane width")
+    window.health_stage.banner(label, "warning")
+    assert label.contentsMargins().top() > 0
+    assert "padding" not in label.styleSheet()
+
+    window.health_stage.banner(label, None)
+    assert label.contentsMargins().top() == 0
+    assert label.styleSheet() == ""
 
 
 # --------------------------------------------------------------------------- #

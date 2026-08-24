@@ -22,13 +22,16 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from rotorid.core.analysis.model_eval import airframe_response
 from rotorid.core.design.recommend import AxisAnalysis
 from rotorid.core.types import Axis
 from rotorid.gui.state import AppState
+from rotorid.gui.theme import Palette
+from rotorid.gui.widgets.layouts import clear
 from rotorid.gui.widgets.plot_base import PlotCard, pen
+from rotorid.gui.widgets.responsive import FlowLayout
 from rotorid.gui.wizard.base import StageWidget
 
 __all__ = ["IdentifyStage"]
@@ -61,24 +64,55 @@ class IdentifyStage(StageWidget):
 
     title = "Identify"
 
-    def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
-        super().__init__(state, parent)
+    def __init__(
+        self,
+        state: AppState,
+        theme: Palette | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(state, theme, parent)
         self._axis: Axis | None = None
 
-        layout = QVBoxLayout(self)
-        self._axis_row = QHBoxLayout()
-        layout.addLayout(self._axis_row)
+        layout = self.page()
+        layout.addWidget(
+            self.header(
+                "Identify",
+                subtitle=(
+                    "The airframe recovered from those segments, and how far the "
+                    "measurement can be trusted at each frequency."
+                ),
+            )
+        )
+
+        self._axis_row = FlowLayout(spacing=6)
+        axis_row = QHBoxLayout()
+        axis_label = QLabel("Axis")
+        axis_label.setObjectName("Eyebrow")
+        axis_row.addWidget(axis_label)
+        axis_row.addLayout(self._axis_row)
+        axis_row.addStretch(1)
+        layout.addLayout(axis_row)
 
         self._verdict = QLabel("")
         self._verdict.setWordWrap(True)
         layout.addWidget(self._verdict)
 
         self._magnitude = PlotCard(
-            "Response", _MAGNITUDE_EXPLANATION, y_label="Magnitude", y_units="dB"
+            "Response",
+            _MAGNITUDE_EXPLANATION,
+            y_label="Magnitude",
+            y_units="dB",
+            theme=self.theme,
         )
         self._coherence = PlotCard(
-            "Coherence", _COHERENCE_EXPLANATION, y_label="Coherence", y_units=""
+            "Coherence",
+            _COHERENCE_EXPLANATION,
+            y_label="Coherence",
+            y_units="",
+            theme=self.theme,
         )
+        self._magnitude.setMinimumHeight(280)
+        self._coherence.setMinimumHeight(180)
         self._coherence.plot.setXLink(self._magnitude.plot)
         self._coherence.plot.setYRange(0.0, 1.05)
         layout.addWidget(self._magnitude, 3)
@@ -99,11 +133,7 @@ class IdentifyStage(StageWidget):
         self._draw()
 
     def _rebuild_axis_row(self, axes: tuple[Axis, ...]) -> None:
-        while self._axis_row.count():
-            item = self._axis_row.takeAt(0)
-            widget = item.widget() if item is not None else None
-            if widget is not None:
-                widget.deleteLater()
+        clear(self._axis_row)
         for axis in axes:
             button = QPushButton(axis.title())
             button.setCheckable(True)
