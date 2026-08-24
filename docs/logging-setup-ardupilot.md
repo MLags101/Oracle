@@ -157,6 +157,28 @@ it is not a weaker answer, it is a different aircraft.
 | `PM` (CPU load) | The check on whether expensive notch options fit in your board's headroom. |
 | `VIBE` (`LOG_BITMASK` bit 2) | Any way to tell whether the gyro measured the aircraft or the frame. |
 | `BAT` and `RCOU` | Operating-point sensitivity: whether the airframe gain moves with throttle or with pack voltage. |
+| `EV` (events) | Any way to tell flight from ground. Without it the whole record is searched, and a vehicle sitting on its legs with the motors idling looks like an excited axis. |
+| `FTN1`/`FTN2` (`FFT_ENABLE = 1`) | Motor-frequency tracking on a vehicle with no ESC telemetry. Without either, every line in the spectrum has to be called structural and no tracking notch can be recommended. |
+
+## 4a. Fly it so one axis at a time is identifiable
+
+This is the part most ordinary flights fail, and it costs nothing to get right.
+
+RotorID identifies an axis from stretches where **that axis was moving and the
+other two were not**. Coordinated flying — roll and pitch together through a turn,
+which is what good flying looks like — produces almost nothing usable, however
+energetic it is. On a thirty-minute test flight that prompted this section, roll
+was driven hard enough for 24 seconds in total and was never once moving alone.
+
+So if you are not flying a sweep, fly deliberate single-axis input: hold two axes
+as still as you can, move the third smoothly from slow to fast, and keep going for
+**at least ten seconds at a stretch**. Five seconds is the bare minimum a window
+needs; ten gives the estimator something to average. Do each axis in turn.
+
+`rotorid analyze` reports exactly what it found per axis as
+`EXCITATION_SHORTFALL` — how long you were airborne, how long the axis was driven,
+how much of that was single-axis, and the longest unbroken run — so a flight that
+fell short tells you by how much.
 
 ## 5. Then fly it again
 

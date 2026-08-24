@@ -326,7 +326,7 @@ The full specification and milestone plan is in
 |---|---|
 | M0 — skeleton, config, data contracts | done |
 | M1 — ArduPilot CLI walking skeleton | done; reads real `.bin` logs |
-| M2 — filter engine | core done; firmware-parity test needs a real pre/post-filter log |
+| M2 — filter engine | core done; reads real pre-filter gyro, parity test needs a pre+post log |
 | M3 — noise, peak classification, notch recommendation | done against synthetic logs |
 | M4 — joint filter + gain optimizer | done; re-solve ~150 ms against the 300 ms budget |
 | M5 — guidance engine and staged flight plan | done |
@@ -337,6 +337,7 @@ The full specification and milestone plan is in
 | M11 — single-file executables | done; `build.py`, verified by the binary's own self-check |
 | General flight logs — declared kind, unbiased estimator, vibration, step response | done |
 | Operating-point sensitivity (spec 5.9) | done against a synthetic mis-set thrust curve |
+| Real-log hardening — units, ground data, aliasing, shared spectral grid | done; see below |
 
 The pipeline runs end to end: log → segment → frequency response with the loop
 divided out → filter chain deconvolved → airframe fit → noise spectrum → filters and
@@ -352,25 +353,61 @@ prediction comes from a fitted model driven through the controller model and the
 measurement from a regularized deconvolution — so it holds only if the
 identification, the controller model and the step recovery are all right at once.
 
-Real ArduPilot logs read correctly and are refused for the right reason — the ones on
-hand were flown without ATTITUDE_FAST, so they carry `RATE` at 10 Hz. A log flown with
-that bit set is what the remaining work needs to close against real data:
+A well-instrumented real log — half an hour of ArduPilot 4.7 with `RATE` at the loop
+rate, raw gyro at 1.6 kHz and the onboard FFT running — found five defects that no
+synthetic fixture could have, because the fixtures were built out of the same
+assumptions the code was:
 
-- the firmware-parity check on the filter engine (M2), which needs a log with
-  pre- *and* post-filter batch gyro in it;
-- a real before/after pair, to put the prediction against a real aircraft rather
-  than a simulated one;
+- **`ATT.Yaw` entered the analysis in degrees** under a key whose contract says
+  radians, because its `degheading` unit was unrecognised and unrecognised units were
+  passed through unconverted. An unknown unit now drops the signal instead: a missing
+  signal is something this tool reports, a mislabelled one is not reportable by
+  anything.
+- **Per-segment Welch windows could not be combined.** Segments are merged by summing
+  spectra, which needs one frequency grid. Invisible on a fixture whose segments are
+  all the same length; fatal on eighteen stick inputs that are not.
+- **"Excited" meant 30% of the axis's peak**, which is right inside a sweep and
+  backwards across half an hour of flying, where the peak is set by the single most
+  violent moment and ordinary stick work never approaches it.
+- **Ten of eighteen candidate windows were on the ground**, disarmed, with the yaw
+  controller swinging against nothing. An aircraft that cannot rotate is not a weak
+  measurement of the rate loop, it is a measurement of the landing gear, and nothing
+  downstream can tell. The vehicle's own landing-state verdict now gates the search.
+- **Raw gyro aliased and rang.** Logged faster than the analysis grid it folded its
+  top half down into the notch designer's band; splined across logging dropouts it
+  produced excursions of forty thousand radians per second.
+
+That log yields no airframe model — the pilot flew roll and pitch together throughout
+and no axis was excited alone for five seconds — and the tool now says so with the
+numbers rather than a shrug. What it does yield is a *measured* pre-filter spectrum
+from `GYR` instead of a reconstructed one, and motor tracking from the onboard FFT on
+a vehicle with no ESC telemetry.
+
+Still waiting on data rather than on code:
+
+- the firmware-parity check on the filter engine (M2), which needs a log with pre-
+  *and* post-filter gyro in it — `INS_LOG_BAT_OPT = 4`, which `rotorid profile` sets;
+- a flight with deliberate single-axis input, to put an identification against a real
+  aircraft rather than a simulated one;
+- a real before/after pair, for the prediction check;
 - a real PX4 autotune log, to confirm the ingest against bytes the vendor wrote
   rather than bytes we wrote.
 
-Each of those is a test that exists and is waiting for its input, not a feature
-that is missing. `rotorid profile` writes the parameter file that produces the
-first one.
+Each is a test that exists and is waiting for its input, not a feature that is
+missing.
 
 ## Develop
 
 ```bash
 .venv/Scripts/python -m pytest
+```
+
+Characterization against whatever real logs are sitting in `logs/` is opt-in,
+because a modern log with raw IMU logging on runs to hundreds of megabytes and
+takes minutes to parse:
+
+```bash
+.venv/Scripts/python -m pytest -m real_log
 ```
 
 ```bash
