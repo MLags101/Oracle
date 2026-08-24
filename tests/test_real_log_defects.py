@@ -256,3 +256,62 @@ def test_a_lock_that_never_happened_is_not_a_very_slow_motor() -> None:
         },
     )
     assert motor_track(silent, float(grid[0]), float(grid[-1])).source != "onboard_fft"
+
+
+# --------------------------------------------------------------------------- #
+# A refusal that can be acted on
+# --------------------------------------------------------------------------- #
+
+
+def test_a_refusal_says_which_requirement_the_flight_fell_short_of() -> None:
+    """ "Fly a tuning flight" is advice. The numbers are a diagnosis.
+
+    Without them the user cannot tell a log the tool discarded from a flight that
+    genuinely had nothing in it, and the two need completely different responses.
+    """
+    from rotorid.core.preprocess.segment import excitation_shortfall
+
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    grid = bundle.signals["rate.roll.output"].t
+    grounded = _grounded(bundle, [])
+
+    flying = {s.axis: s for s in excitation_shortfall(bundle)}
+    assert flying["roll"].longest_run_s >= 5.0, "the fixture does excite roll on its own"
+    assert flying["roll"].binding == "nothing"
+
+    never = {s.axis: s for s in excitation_shortfall(grounded)}
+    assert never["roll"].airborne_s == 0.0
+    assert never["roll"].binding == "never off the ground"
+    assert grid.size  # the fixture is not empty, so the verdict is about the gate
+
+
+def test_the_shortfall_separates_being_quiet_from_flying_coordinated() -> None:
+    """The gap between active and single-axis time is the cost of coordinated flying.
+
+    An axis that was driven hard for thirty seconds but never alone needs a
+    different instruction from one that was never driven at all.
+    """
+    import dataclasses
+
+    from rotorid.core.preprocess.segment import excitation_shortfall
+
+    bundle = make_general_flight_bundle(make_airframe(), make_chain())
+    # Copy the excited roll command onto pitch, so both axes move together and
+    # neither can satisfy the single-axis rule any more.
+    coupled = dataclasses.replace(
+        bundle,
+        signals={
+            **bundle.signals,
+            "rate.pitch.output": canonical_signal(
+                "rate.pitch.output",
+                bundle.signals["rate.roll.output"].t,
+                bundle.signals["rate.roll.output"].y.copy(),
+                source_msg="RATE.POut",
+            ),
+        },
+    )
+
+    shortfall = {s.axis: s for s in excitation_shortfall(coupled)}
+    assert shortfall["roll"].active_s > 0.0, "roll was still being driven"
+    assert shortfall["roll"].single_axis_s == pytest.approx(0.0, abs=0.5)
+    assert shortfall["roll"].binding == "this axis never moved on its own"

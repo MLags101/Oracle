@@ -16,7 +16,7 @@ says the flight they flew, and the model underneath came from somewhere else.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
@@ -32,7 +32,13 @@ from rotorid.core.types import (
     SegmentKind,
 )
 
-__all__ = ["airborne_windows", "propose_segments"]
+__all__ = [
+    "MIN_SEGMENT_S",
+    "ExcitationShortfall",
+    "airborne_windows",
+    "excitation_shortfall",
+    "propose_segments",
+]
 
 #: Confidence by excitation kind. A commanded sweep is worth several times what
 #: an energetic bit of stick input is, and the difference has to survive into the
@@ -79,7 +85,101 @@ _EXCITED_MULTIPLE_OF_MEDIAN = 4.0
 _ENERGY_MIN_AMPLITUDE = 0.01
 
 #: Shorter than this and there is no low-frequency information in the window.
-_MIN_SEGMENT_S = 5.0
+#: Public because a refusal has to be able to quote the bar it was measured
+#: against; a number the user is judged by and cannot see is not a threshold, it
+#: is a secret.
+MIN_SEGMENT_S = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class ExcitationShortfall:
+    """Why an axis produced no segment, in numbers rather than in advice.
+
+    A refusal that only says "fly a tuning flight" leaves the user unable to tell
+    a log that was thrown away from a flight that genuinely had nothing in it.
+    These are the three quantities that decide, in the order they are applied, so
+    the report can name the one that actually bound.
+
+    Attributes:
+        airborne_s: Time the vehicle declared itself off the ground, or ``None``
+            when the log never said -- which is different from zero.
+        active_s: Time this axis was above its excitation threshold while
+            airborne, ignoring the other two axes entirely.
+        single_axis_s: The same, with the cross-axis quiet rule applied. The gap
+            between this and ``active_s`` is the cost of flying coordinated.
+        longest_run_s: Longest continuous single-axis stretch. Compared against
+            the five seconds a window needs, this is usually the binding one.
+    """
+
+    axis: Axis
+    airborne_s: float | None
+    active_s: float
+    single_axis_s: float
+    longest_run_s: float
+
+    @property
+    def binding(self) -> str:
+        """The first requirement this axis failed, named for a report."""
+        if self.airborne_s is not None and self.airborne_s <= 0.0:
+            return "never off the ground"
+        if self.active_s <= 0.0:
+            return "this axis was never driven hard enough"
+        if self.single_axis_s <= 0.0:
+            return "this axis never moved on its own"
+        if self.longest_run_s < MIN_SEGMENT_S:
+            return "no single-axis stretch lasted long enough"
+        return "nothing"
+
+
+def excitation_shortfall(bundle: LogBundle) -> tuple[ExcitationShortfall, ...]:
+    """Measure what ordinary flight offered on each axis, whether or not it sufficed.
+
+    Deliberately re-derived from the same envelopes :func:`_energy_segments` uses
+    rather than inferred from the segments it returned: an empty result is exactly
+    the case this exists to explain, and there is nothing to infer from.
+    """
+    windows = airborne_windows(bundle)
+    envelopes = _output_envelopes(bundle)
+    if envelopes is None:
+        return ()
+
+    t = bundle.signals[f"rate.{AXES[0]}.output"].t
+    dt = float(t[1] - t[0]) if t.size > 1 else 0.0
+    inside = _mask_for(t, windows)
+    airborne_s = None if windows is None else sum(end - start for start, end in windows)
+
+    out: list[ExcitationShortfall] = []
+    for axis in AXES:
+        threshold = _excitation_threshold(envelopes[axis], inside)
+        if threshold is None:
+            out.append(ExcitationShortfall(axis, airborne_s, 0.0, 0.0, 0.0))
+            continue
+        others = np.maximum.reduce([envelopes[a] for a in AXES if a != axis])
+        active = inside & (envelopes[axis] > threshold)
+        alone = active & (others < envelopes[axis] * _CROSS_AXIS_QUIET_RATIO)
+        runs = _runs(alone, t)
+        out.append(
+            ExcitationShortfall(
+                axis=axis,
+                airborne_s=airborne_s,
+                active_s=float(np.count_nonzero(active)) * dt,
+                single_axis_s=float(np.count_nonzero(alone)) * dt,
+                longest_run_s=max((end - start for start, end in runs), default=0.0),
+            )
+        )
+    return tuple(out)
+
+
+def _output_envelopes(bundle: LogBundle) -> dict[Axis, FloatArray] | None:
+    """Smoothed activity envelope per axis, or ``None`` if an axis is missing."""
+    rate = bundle.sample_rate_hz
+    envelopes: dict[Axis, FloatArray] = {}
+    for axis in AXES:
+        key = f"rate.{axis}.output"
+        if key not in bundle.signals:
+            return None
+        envelopes[axis] = _envelope(bundle.signals[key].y, rate)
+    return envelopes
 
 
 def propose_segments(
@@ -164,7 +264,7 @@ def _systemid_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
         signal = bundle.signals[key]
         active = np.abs(signal.y) > 1e-6
         for start, end in _runs(active, signal.t):
-            if end - start < _MIN_SEGMENT_S:
+            if end - start < MIN_SEGMENT_S:
                 continue
             out.append(
                 ExcitationSegment(
@@ -245,13 +345,9 @@ def _energy_segments(
             and in both cases the excitation threshold is computed over the
             window rather than over the whole log.
     """
-    rate = bundle.sample_rate_hz
-    envelopes: dict[Axis, FloatArray] = {}
-    for axis in AXES:
-        key = f"rate.{axis}.output"
-        if key not in bundle.signals:
-            return ()
-        envelopes[axis] = _envelope(bundle.signals[key].y, rate)
+    envelopes = _output_envelopes(bundle)
+    if envelopes is None:
+        return ()
 
     t = bundle.signals[f"rate.{AXES[0]}.output"].t
     inside = _mask_for(t, windows)
@@ -267,7 +363,7 @@ def _energy_segments(
             & (others < envelopes[axis] * _CROSS_AXIS_QUIET_RATIO)
         )
         for start, end in _runs(excited, t):
-            if end - start < _MIN_SEGMENT_S:
+            if end - start < MIN_SEGMENT_S:
                 continue
             window = (t >= start) & (t <= end)
             out.append(

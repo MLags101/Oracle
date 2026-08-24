@@ -37,6 +37,7 @@ from rotorid.core.analysis.sysid import check_filter_model
 from rotorid.core.analysis.vibration import VibrationSummary, vibration_summary
 from rotorid.core.design.recommend import AxisAnalysis
 from rotorid.core.logkind import capabilities, detect_kind, kind_evidence
+from rotorid.core.preprocess.segment import MIN_SEGMENT_S
 from rotorid.core.types import AXES, Axis, Finding, LogBundle, TuneRecommendation
 
 __all__ = ["CHECKS", "GuidanceContext", "collect_findings"]
@@ -206,6 +207,81 @@ def check_log_kind(context: GuidanceContext) -> list[Finding]:
                     "rating require."
                 ),
                 action="Nothing. This is the log the analysis is designed around.",
+            )
+        )
+    return out
+
+
+def check_excitation_shortfall(context: GuidanceContext) -> list[Finding]:
+    """Why an ordinary flight yielded nothing, in numbers.
+
+    Only for the axes that produced no identification, and only on a general
+    flight -- a tuning flight that failed has a different and simpler answer,
+    which is that the sweep is not in the log.
+
+    The refusal itself already says what to do. What it cannot say is which of
+    the three requirements the flight fell short of, and that is the difference
+    between "your log was discarded" and "you flew for half an hour and never
+    moved one axis on its own". A user handed the first has no next step; a user
+    handed the second knows exactly what to fly.
+    """
+    from rotorid.core.preprocess.segment import excitation_shortfall
+
+    if context.bundle.kind != "general":
+        return []
+    missing = [a for a in AXES if a not in context.analyses]
+    if not missing:
+        return []
+
+    out: list[Finding] = []
+    for shortfall in excitation_shortfall(context.bundle):
+        if shortfall.axis not in missing or shortfall.binding == "nothing":
+            continue
+        evidence = {
+            "active_s": round(shortfall.active_s, 1),
+            "single_axis_s": round(shortfall.single_axis_s, 1),
+            "longest_run_s": round(shortfall.longest_run_s, 1),
+        }
+        if shortfall.airborne_s is not None:
+            evidence["airborne_s"] = round(shortfall.airborne_s, 1)
+
+        coordinated = (
+            shortfall.active_s > 0.0 and shortfall.single_axis_s < 0.25 * shortfall.active_s
+        )
+        out.append(
+            Finding(
+                severity="info",
+                code="EXCITATION_SHORTFALL",
+                title=f"{shortfall.axis}: {shortfall.binding}",
+                detail=(
+                    (
+                        f"The vehicle was off the ground for "
+                        f"{shortfall.airborne_s:.0f} s of this log. "
+                        if shortfall.airborne_s is not None
+                        else "This log does not record when the vehicle was off the ground, "
+                        "so the whole record was searched. "
+                    )
+                    + f"Within that, {shortfall.axis} was driven hard enough for "
+                    f"{shortfall.active_s:.0f} s, of which {shortfall.single_axis_s:.0f} s "
+                    f"had the other two axes quiet enough for the single-axis assumption "
+                    f"to hold. The longest unbroken stretch was "
+                    f"{shortfall.longest_run_s:.1f} s, against the {MIN_SEGMENT_S:.0f} s a "
+                    f"window needs to carry any low-frequency information."
+                    + (
+                        " Almost all of the activity on this axis happened while another "
+                        "axis was moving too, which is what coordinated flying looks like "
+                        "and is why so little of it is usable."
+                        if coordinated
+                        else ""
+                    )
+                ),
+                action=(
+                    "Fly one axis at a time: hold the other two as still as you can and "
+                    "move this one smoothly from slow to fast for at least ten seconds at "
+                    "a stretch. A SYSTEMID sweep or an autotune run does this for you and "
+                    f"is worth more again (see {_doc(context)})."
+                ),
+                evidence=evidence,
             )
         )
     return out
@@ -1497,6 +1573,7 @@ def _ratio(new: float, old: float) -> float:
 #: the module readable.
 CHECKS: tuple[Check, ...] = (
     check_log_kind,
+    check_excitation_shortfall,
     check_vibration,
     check_clipping,
     check_oscillation,
