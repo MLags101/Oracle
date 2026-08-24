@@ -32,6 +32,7 @@ from scipy.signal import find_peaks, peak_widths, spectrogram
 
 from rotorid.core.filters.chain import FilterChain, OperatingPoint
 from rotorid.core.types import (
+    AXES,
     Axis,
     FloatArray,
     LogBundle,
@@ -85,16 +86,24 @@ _STEADY_TOLERANCE = 0.05
 #: coarse to separate a line from its neighbours.
 _STEADY_MIN_SECONDS = 4.0
 
+#: Below this, the onboard FFT is reporting no lock rather than a very slow motor.
+#: No multirotor's fundamental sits under 10 Hz -- that is 600 rpm, well below
+#: where a propeller produces thrust.
+_FFT_MIN_LOCK_HZ = 10.0
+
 
 @dataclass(frozen=True, slots=True)
 class MotorTrack:
     """Motor fundamental frequency over time, and where the number came from.
 
     Attributes:
-        source: Provenance, in descending order of trust. ``"throttle_model"`` is
-            a *shape* only -- its absolute scale depends on ``MOT_THST_HOVER``
-            being right -- so it may be used to classify tracking but never to set
-            a notch centre directly.
+        source: Provenance, in descending order of trust. ``"onboard_fft"`` is a
+            genuine frequency measurement, made by the vehicle rather than by us,
+            and ranks just below measured RPM: it is the same quantity, detected
+            from the gyro rather than counted at the ESC, so it can lose lock
+            where telemetry cannot. ``"throttle_model"`` is a *shape* only -- its
+            absolute scale depends on ``MOT_THST_HOVER`` being right -- so it may
+            be used to classify tracking but never to set a notch centre directly.
         f_hz: Fundamental frequency per sample of :attr:`t`. For
             ``throttle_model`` this is ``sqrt(throttle)`` in arbitrary units.
         per_motor_hz: One trace per motor where the log has them, for per-motor
@@ -103,7 +112,7 @@ class MotorTrack:
 
     t: FloatArray
     f_hz: FloatArray
-    source: Literal["esc_telemetry", "rpm_sensor", "throttle_model", "none"]
+    source: Literal["esc_telemetry", "rpm_sensor", "onboard_fft", "throttle_model", "none"]
     per_motor_hz: tuple[FloatArray, ...] = ()
 
     @property
@@ -166,6 +175,11 @@ def motor_track(bundle: LogBundle, t_start: float, t_end: float) -> MotorTrack:
             per_motor_hz=tuple(np.asarray(p, dtype=np.float64) for p in per_motor),
         )
 
+    onboard = _fft_trace(bundle, t_start, t_end)
+    if onboard is not None:
+        t, f_hz = onboard
+        return MotorTrack(t=t, f_hz=f_hz, source="onboard_fft")
+
     throttle = _throttle_trace(bundle, t_start, t_end)
     if throttle is not None:
         t, value = throttle
@@ -174,6 +188,51 @@ def motor_track(bundle: LogBundle, t_start: float, t_end: float) -> MotorTrack:
     return MotorTrack(
         t=np.zeros(0, dtype=np.float64), f_hz=np.zeros(0, dtype=np.float64), source="none"
     )
+
+
+def _fft_trace(
+    bundle: LogBundle, t_start: float, t_end: float
+) -> tuple[FloatArray, FloatArray] | None:
+    """Motor fundamental as the vehicle's own FFT detected it, in Hz.
+
+    Averaged across the axes that reported a peak, because the motors are one
+    physical thing and three gyro axes are three views of it -- but only over
+    samples where a peak was actually reported. A zero in this trace means the
+    FFT had no lock, not that the motors stopped, and averaging the zeros in
+    would drag the fundamental below where any notch should sit.
+
+    Returns:
+        ``(t, f_hz)``, or ``None`` when the log has no onboard FFT or the FFT
+        never locked inside the window.
+    """
+    traces = [
+        bundle.signals[f"fft.{axis}.peak_hz"]
+        for axis in AXES
+        if f"fft.{axis}.peak_hz" in bundle.signals
+    ]
+    if not traces:
+        return None
+    reference = traces[0]
+    window = (reference.t >= t_start) & (reference.t <= t_end)
+    if not window.any():
+        return None
+
+    t = reference.t[window]
+    stacked = np.vstack([np.interp(t, s.t, s.y) for s in traces])
+    locked = stacked > _FFT_MIN_LOCK_HZ
+    if not locked.any():
+        return None
+    f_hz = np.divide(
+        np.sum(np.where(locked, stacked, 0.0), axis=0),
+        np.maximum(np.count_nonzero(locked, axis=0), 1),
+    )
+    # Samples where no axis had a lock are filled from the ones that did rather
+    # than left at zero, so the trace stays a frequency throughout.
+    held = np.count_nonzero(locked, axis=0) > 0
+    if not held.any():
+        return None
+    f_hz = np.interp(t, t[held], f_hz[held])
+    return t, np.asarray(f_hz, dtype=np.float64)
 
 
 def _throttle_trace(

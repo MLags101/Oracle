@@ -50,6 +50,10 @@ CANONICAL_KEYS: dict[str, str] = {
     **_per_axis("att.{axis}.setpoint", "rad"),
     **_per_axis("att.{axis}.measured", "rad"),
     **_per_axis("gyro.{axis}.prefilter", "rad/s"),
+    # Where the vehicle's own FFT says the motors are, per axis. The stand-in for
+    # ESC telemetry on a vehicle that has none, and the only thing that lets a
+    # peak be called a motor line rather than a frame resonance.
+    **_per_axis("fft.{axis}.peak_hz", "Hz"),
     **_per_axis("excite.{axis}", "normalized"),
     "batt.voltage": "V",
     "batt.current": "A",
@@ -60,6 +64,16 @@ CANONICAL_KEYS: dict[str, str] = {
     # wants the same question answered -- was the aircraft being deliberately
     # excited here -- so the difference is resolved in the readers.
     "mode.autotune": "normalized",
+    # 1 while the vehicle believed itself to be off the ground. The single most
+    # consequential gate there is: a rate loop with the airframe missing from it
+    # is a different plant, and an identification that does not know the
+    # difference will fit a model to a vehicle sitting on its legs with the
+    # motors idling and report it with the same confidence as a real flight.
+    "mode.flying": "normalized",
+    # 1 while the motors were armed. Weaker than `mode.flying` and kept separately
+    # because it is what the older logs carry: armed says the propellers were
+    # turning, which rules out the bench but not the ground.
+    "mode.armed": "normalized",
 }
 
 #: Keys that take an index, e.g. ``motor.3.rpm`` or ``imu.1.vibe.z``.

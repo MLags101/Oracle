@@ -27,11 +27,13 @@ __all__ = [
     "InstrumentedEstimate",
     "SpectralEstimate",
     "choose_nperseg",
+    "choose_shared_nperseg",
     "combine",
     "combine_iv",
     "estimate_frf",
     "estimate_frf_iv",
     "log_smooth",
+    "lowest_resolvable_hz",
     "power_spectrum",
 ]
 
@@ -42,6 +44,12 @@ _OVERLAP_FRACTION = 0.5
 #: Cycles of the lowest frequency of interest that must fit inside one Welch
 #: segment for that frequency to be resolved at all.
 _CYCLES_TO_RESOLVE = 2.0
+
+#: Where the band is wanted to start when no sweep declared one. Below half a
+#: hertz a pilot is not exciting the aircraft, they are trimming it -- the stick
+#: is holding an attitude rather than asking for a change, and the response
+#: carries no information about the rate loop.
+_PILOT_F_LOWEST = 0.5
 
 #: How wide a gap in log frequency may be bridged when deciding which coherent
 #: bins form one band. A tenth of a decade spans a notch's coherence dip without
@@ -326,6 +334,107 @@ def _gate(
         output_signal=output_signal,
         n_segments_averaged=n_segments,
     )
+
+
+def lowest_resolvable_hz(nperseg: int, sample_rate_hz: float) -> float:
+    """The lowest frequency a Welch window of this length can say anything about.
+
+    The inverse of the requirement inside :func:`choose_nperseg`, and named so the
+    number of cycles that constitutes "resolved" lives in one place. A window
+    holding one cycle of a frequency has not measured it; two is the least that
+    separates a periodic component from a trend.
+    """
+    return _CYCLES_TO_RESOLVE * sample_rate_hz / float(nperseg)
+
+
+def choose_shared_nperseg(
+    sizes: Sequence[int],
+    sample_rate_hz: float,
+    *,
+    f_lowest_hz: float | None,
+    min_averages: int,
+) -> tuple[int, float, list[int]]:
+    """One Welch length for every segment of an axis, and what band it supports.
+
+    Segments are merged by summing their spectra, which requires them to sit on
+    the same frequency grid -- so the window length is a property of the *axis*,
+    not of each segment. Choosing it per segment produces estimates that cannot
+    be combined at all, which is invisible on a fixture whose segments happen to
+    be the same length and fatal on a real flight whose stick inputs are not.
+
+    Both cases start from a frequency the band is *wanted* to reach: the one a
+    sweep declared, or :data:`_PILOT_F_LOWEST` for ordinary flight, below which
+    stick movement is trim rather than excitation. The window is then the usual
+    trade -- long enough to resolve that, short enough that ``min_averages`` of
+    them fit -- exactly as :func:`choose_nperseg` makes it for a single record.
+
+    Where the two differ is what happens when the windows are too short to reach
+    it. A declared sweep is an error: the user asked for 0.05 Hz, the record
+    cannot show it, and saying so is actionable. Ordinary flight is not, because
+    nobody asked for anything -- so the band simply starts wherever the windows
+    can start, and the narrower result flows into the confidence rating on its
+    own. Refusing a flight for failing a test nobody set is how eighteen usable
+    stick inputs come to report nothing at all.
+
+    Args:
+        sizes: Sample count of each candidate segment, in the caller's order.
+
+    Returns:
+        ``(nperseg, f_lowest_hz, usable)`` where ``usable`` indexes the segments
+        long enough to contribute at this window length.
+
+    Raises:
+        ValueError: if a declared band cannot be resolved, or if the segments
+            that can contribute do not add up to ``min_averages`` Welch averages
+            between them.
+    """
+    if not sizes:
+        raise ValueError("no segments to plan a spectral estimate over")
+
+    longest = max(sizes)
+    wanted = f_lowest_hz if f_lowest_hz is not None else _PILOT_F_LOWEST
+    needed = int(np.ceil(_CYCLES_TO_RESOLVE * sample_rate_hz / wanted))
+
+    if needed <= longest:
+        # Resolution is affordable, so spend no more of it than was asked for and
+        # keep the rest as averages -- the same balance choose_nperseg strikes.
+        allowed = 2.0 * longest / (min_averages + 1)
+        nperseg = 1 << int(np.floor(np.log2(max(float(needed), min(allowed, float(longest))))))
+        if nperseg < needed:
+            nperseg <<= 1
+        lowest = wanted
+    elif f_lowest_hz is not None:
+        raise ValueError(
+            f"the longest window is {longest / sample_rate_hz:.1f} s, which cannot "
+            f"resolve {f_lowest_hz:g} Hz; at least {needed / sample_rate_hz:.1f} s is needed"
+        )
+    else:
+        nperseg = 1 << int(np.floor(np.log2(longest)))
+        lowest = lowest_resolvable_hz(nperseg, sample_rate_hz)
+
+    usable, _ = _usable_at(sizes, nperseg)
+    if not usable:
+        raise ValueError(
+            f"no window is long enough for the {nperseg / sample_rate_hz:.1f} s Welch "
+            f"segment that {lowest:g} Hz needs"
+        )
+    # Resolution wins over averaging, deliberately and exactly as
+    # :func:`choose_nperseg` decides it for a single record: an FRF averaged only
+    # three times is noisy but usable, whereas one that cannot see the lowest
+    # excited frequency is useless. The shortfall is not hidden -- it reaches the
+    # caller as a low ``n_segments`` on the estimate and a wide coherence spread.
+    return nperseg, lowest, usable
+
+
+def _usable_at(sizes: Sequence[int], nperseg: int) -> tuple[list[int], int]:
+    """Which segments can hold this window, and how many averages they give.
+
+    Welch with 50% overlap fits ``2n/L - 1`` windows into ``n`` samples, and a
+    segment exactly one window long still contributes one.
+    """
+    usable = [i for i, n in enumerate(sizes) if n >= nperseg]
+    averages = sum(max(1, int(2 * sizes[i] / nperseg) - 1) for i in usable)
+    return usable, averages
 
 
 def choose_nperseg(

@@ -32,7 +32,7 @@ from rotorid.core.types import (
     SegmentKind,
 )
 
-__all__ = ["propose_segments"]
+__all__ = ["airborne_windows", "propose_segments"]
 
 #: Confidence by excitation kind. A commanded sweep is worth several times what
 #: an energetic bit of stick input is, and the difference has to survive into the
@@ -48,20 +48,34 @@ _CONFIDENCE = {
 #: otherwise the single-axis assumption behind the identification is violated.
 _CROSS_AXIS_QUIET_RATIO = 0.4
 
-#: Fallback detection: high-pass corner, and what counts as "excited".
-#:
-#: The threshold is a fraction of the axis's own *peak* rather than a multiple of
-#: its median, and that choice matters more than it looks. A deliberate slow-to-
-#: fast sweep -- exactly the thing worth identifying from -- has a nearly flat
-#: envelope, so it never rises to several times its own median and a
-#: median-relative rule cannot see it at all. It can only find bursts, which is
-#: the one kind of excitation that identifies badly.
+#: High-pass corner for the activity envelope. Applied before anything else,
+#: because a vehicle held in a steady banked turn has a large mean output and no
+#: information in it at all.
 _ENERGY_HIGHPASS_HZ = 0.3
-_EXCITED_FRACTION_OF_PEAK = 0.3
 
-#: Below this peak envelope, in normalized mixer output, there is not enough
-#: signal to identify anything and the "excitation" is the controller reacting to
-#: air. 1% of full output is already a very small stick input.
+#: What counts as "excited". Two rules, and a window passes if it satisfies
+#: *either*, because each one is blind to exactly what the other sees.
+#:
+#: Peak-relative finds sustained excitation. A slow-to-fast sweep or an autotune
+#: twitch has a nearly flat envelope and never rises to several times its own
+#: median, so a median-relative rule cannot see it at all -- it can only find
+#: bursts, which is the one kind of excitation that identifies badly.
+#:
+#: Median-relative finds bursts. Across half an hour of ordinary flying the peak
+#: is set by whichever manoeuvre was the most violent, so 30% of it is enormous
+#: and ordinary stick work never reaches it: a long flight full of usable input
+#: reports nothing at all. There the question is whether this axis was being
+#: driven harder than the flight's own idle.
+#:
+#: Taking the lower of the two thresholds is what makes the detector see both. The
+#: absolute floor below still applies underneath, so "more permissive" never means
+#: "admits noise".
+_EXCITED_FRACTION_OF_PEAK = 0.3
+_EXCITED_MULTIPLE_OF_MEDIAN = 4.0
+
+#: Below this envelope, in normalized mixer output, there is not enough signal to
+#: identify anything and the "excitation" is the controller reacting to air. 1% of
+#: full output is already a very small stick input.
 _ENERGY_MIN_AMPLITUDE = 0.01
 
 #: Shorter than this and there is no low-frequency information in the window.
@@ -87,11 +101,48 @@ def propose_segments(
     """
     if (kind if kind is not None else bundle.kind) == "tuning":
         return _deliberate_segments(bundle)
-    return _energy_segments(bundle)
+    return _energy_segments(bundle, windows=airborne_windows(bundle))
+
+
+def airborne_windows(bundle: LogBundle) -> Sequence[tuple[float, float]] | None:
+    """When the vehicle was off the ground, or ``None`` if the log does not say.
+
+    Identifying from a vehicle sitting on its legs is not a weak measurement, it
+    is a measurement of a different plant: the airframe is not free to rotate, so
+    the rate loop sees a constraint instead of an inertia and the model that comes
+    back describes the landing gear. Nothing downstream can detect that -- the
+    coherence is whatever it is, the fit residual is whatever it is -- so it has
+    to be excluded here.
+
+    The vehicle's own verdict is used rather than a throttle threshold invented
+    here. The firmware has the accelerometers, the climb rate and the motor
+    demand, and it is the same judgement it uses to decide whether to let the
+    pilot disarm.
+
+    Returns:
+        The windows, or ``None`` when the log carries no landing state at all --
+        in which case the search is unrestricted and
+        :func:`~rotorid.core.guidance.findings.check_ground_time` says what that
+        cost. ``None`` and "the vehicle never flew" are deliberately different:
+        an empty tuple means it never left the ground, and refuses everything.
+    """
+    for key in ("mode.flying", "mode.armed"):
+        gate = bundle.signals.get(key)
+        if gate is not None and gate.t.size > 1:
+            return _runs(gate.y > 0.5, gate.t)
+    return None
 
 
 def _deliberate_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
-    """Excitation somebody asked for: an injected sweep, or an autotune run."""
+    """Excitation somebody asked for: an injected sweep, or an autotune run.
+
+    Not restricted to the airborne window, unlike ordinary flight. A sweep or an
+    autotune is something a person deliberately started, and if they started it
+    on the ground the answer they need is the one the identification gives them
+    about that -- refusing to look would leave them with a chirp in a log and no
+    explanation. Ordinary stick activity carries no such intent, so a match found
+    on the ground there is simply a false positive.
+    """
     chirps = _systemid_segments(bundle)
     if chirps:
         return chirps
@@ -180,12 +231,19 @@ def _autotune_segments(bundle: LogBundle) -> tuple[ExcitationSegment, ...]:
 def _energy_segments(
     bundle: LogBundle, windows: Sequence[tuple[float, float]] | None = None
 ) -> tuple[ExcitationSegment, ...]:
-    """Fallback: stretches of ordinary flight with strong single-axis activity.
+    """Stretches with strong single-axis activity, inside an optional restriction.
 
-    Always low confidence. Pilot input is narrow-band, correlated across axes, and
-    mixed with the controller's own response to disturbances, so an airframe
-    identified this way is a rough estimate wearing the same clothes as a good
-    one. The confidence value is what keeps them distinguishable downstream.
+    Always low confidence when it stands on its own. Pilot input is narrow-band,
+    correlated across axes, and mixed with the controller's own response to
+    disturbances, so an airframe identified this way is a rough estimate wearing
+    the same clothes as a good one. The confidence value is what keeps them
+    distinguishable downstream.
+
+    Args:
+        windows: Where to look. Two restrictions use this -- the span of a
+            declared autotune run, and the span the vehicle was off the ground --
+            and in both cases the excitation threshold is computed over the
+            window rather than over the whole log.
     """
     rate = bundle.sample_rate_hz
     envelopes: dict[Axis, FloatArray] = {}
@@ -196,18 +254,13 @@ def _energy_segments(
         envelopes[axis] = _envelope(bundle.signals[key].y, rate)
 
     t = bundle.signals[f"rate.{AXES[0]}.output"].t
-    # Confining the search also confines what "peak" means, which is the point:
-    # the threshold is a fraction of the largest excitation *in the window*, so a
-    # gentle autotune twitch is not measured against a violent stick input that
-    # happened somewhere else in the flight.
     inside = _mask_for(t, windows)
     out: list[ExcitationSegment] = []
     for axis in AXES:
         others = np.maximum.reduce([envelopes[a] for a in AXES if a != axis])
-        peak = float(np.max(envelopes[axis][inside])) if inside.any() else 0.0
-        if peak < _ENERGY_MIN_AMPLITUDE:
+        threshold = _excitation_threshold(envelopes[axis], inside)
+        if threshold is None:
             continue
-        threshold = _EXCITED_FRACTION_OF_PEAK * peak
         excited = (
             inside
             & (envelopes[axis] > threshold)
@@ -228,6 +281,32 @@ def _energy_segments(
                 )
             )
     return tuple(sorted(out, key=lambda s: -s.duration_s))
+
+
+def _excitation_threshold(envelope: FloatArray, inside: BoolArray) -> float | None:
+    """The level this axis has to exceed to count as being driven.
+
+    Both statistics are taken over the search window rather than the whole log,
+    which is what stops a gentle autotune twitch being measured against a violent
+    stick input that happened somewhere else in the flight.
+
+    Returns:
+        The threshold, or ``None`` when there is not enough signal on this axis
+        for any threshold to mean anything.
+    """
+    if not inside.any():
+        return None
+    within = envelope[inside]
+    peak = float(np.max(within))
+    if peak < _ENERGY_MIN_AMPLITUDE:
+        return None
+    sustained = _EXCITED_FRACTION_OF_PEAK * peak
+    bursty = _EXCITED_MULTIPLE_OF_MEDIAN * float(np.median(within))
+    # The absolute floor gates the *peak* above, not the threshold. Once a window
+    # is known to contain real excitation, how far down its own skirts to follow
+    # it is a separate question, and clamping the threshold up to the floor would
+    # discard the quieter half of a gently flown but perfectly usable input.
+    return min(sustained, bursty)
 
 
 def _mask_for(t: FloatArray, windows: Sequence[tuple[float, float]] | None) -> BoolArray:

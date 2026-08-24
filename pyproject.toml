@@ -78,7 +78,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+# Real-log characterization is opt-in: `pytest -m real_log`. A single modern
+# ArduPilot log with raw IMU logging on runs to hundreds of megabytes and
+# takes minutes to parse, and a suite nobody will sit through is a suite
+# nobody runs.
+addopts = "-q --strict-markers -m \"not real_log\""
 markers = [
     "slow: takes more than a couple of seconds",
     "real_log: needs a real flight log fixture (characterization test)",

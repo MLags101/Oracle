@@ -84,6 +84,17 @@ _UNIT_SCALE: dict[str, float] = {
     # or the reader warns and refuses to convert.
     "m/s/s": 1.0,
     "m/s^2": 1.0,
+    # ArduPilot's unit for a compass heading. Degrees, but spelled separately
+    # because a heading is allowed to run outside 0-360 and is therefore not
+    # interchangeable with a bounded angle. Missing this one is not cosmetic: it
+    # put ATT.Yaw and ATT.DesYaw into the bundle in degrees under a key whose
+    # contract says radians, which is a factor of 57 hiding behind a warning.
+    "degheading": np.pi / 180.0,
+    # Servo and motor outputs, in raw PWM microseconds. Deliberately left
+    # unscaled: `motor.{n}.output` is defined as the PWM the vehicle wrote, and
+    # the normalization against MOT_PWM_MIN/MAX happens where those parameters
+    # are in scope rather than here.
+    "us": 1.0,
     "instance": 1.0,
     "": 1.0,
     "normalized": 1.0,
@@ -105,7 +116,29 @@ _MESSAGES_WANTED = (
     "PM",
     "MSG",
     "EV",
+    "GYR",
+    "FTN1",
+    "FTN2",
 )
+
+#: ``GYR`` carries the raw sensor samples, before the vehicle's gyro filters --
+#: which is the one thing that turns filter verification from a comparison of two
+#: models into a measurement (spec 5.5). It arrives per IMU instance at the
+#: backend's own rate, which on an H7 board is well over a kilohertz.
+#:
+#: ``INS_RAW_LOG_OPT`` bit 3 asks the firmware to log the *post*-filter samples
+#: here instead. When it is set the data is no longer pre-filter and must not be
+#: labelled as though it were, so the bit is read rather than assumed.
+_RAW_LOG_OPT_POST_FILTER_BIT = 3
+
+#: Axis order inside ``GYR``'s ``GyrX/Y/Z``, matching the vehicle's body frame.
+_GYR_FIELD: dict[Axis, str] = {"roll": "GyrX", "pitch": "GyrY", "yaw": "GyrZ"}
+
+#: Per-axis peak and bandwidth from ArduPilot's onboard FFT. On a vehicle with no
+#: ESC telemetry this is the only measurement of where the motors actually are,
+#: and without it every line in the spectrum has to be called structural -- a
+#: tracking notch cannot be recommended for a peak nothing has shown to move.
+_FTN2_PEAK: dict[Axis, str] = {"roll": "PkX", "pitch": "PkY", "yaw": "PkZ"}
 
 #: ArduPilot ``LogEvent`` codes that bracket an autotune run. Numeric rather than
 #: read out of ``MSG`` text: the codes are enum constants that have not moved in
@@ -114,6 +147,20 @@ _MESSAGES_WANTED = (
 #: on the author's firmware and nowhere else.
 _EV_AUTOTUNE_START = frozenset({30, 32})  # INITIALISED, RESTART
 _EV_AUTOTUNE_STOP = frozenset({31, 33, 34})  # OFF, SUCCESS, FAILED
+
+#: Codes that bracket a flight. ``NOT_LANDED`` and ``LAND_COMPLETE`` are the
+#: vehicle's own verdict on whether it is off the ground, which is a far better
+#: answer than any throttle threshold this tool could invent -- the firmware has
+#: the accelerometers, the climb rate and the motor demand, and it is the same
+#: judgement it uses to decide whether to let the pilot disarm.
+#:
+#: ``LAND_COMPLETE_MAYBE`` (17) deliberately does not end a flight. It is the
+#: firmware saying it is not sure, and a window that ends on a maybe would throw
+#: away the descent.
+_EV_TAKEOFF = frozenset({28})  # NOT_LANDED
+_EV_LANDED = frozenset({18})  # LAND_COMPLETE
+_EV_ARMED = frozenset({10})
+_EV_DISARMED = frozenset({11})
 
 _AXIS_LETTER: dict[Axis, str] = {"roll": "R", "pitch": "P", "yaw": "Y"}
 _PID_AXIS: dict[str, Axis] = {"PIDR": "roll", "PIDP": "pitch", "PIDY": "yaw"}
@@ -235,14 +282,29 @@ class ArduPilotReader(LogReader):
             self._warnings.append(note)
         return fallback
 
-    def _scale(self, unit: str, kind: str, field: str) -> float:
+    def _scale(self, unit: str, kind: str, field: str) -> float | None:
+        """Multiplier to canonical units, or ``None`` if the unit is unknown.
+
+        ``None`` drops the signal. The alternative -- passing the numbers through
+        unconverted while still stamping them with the canonical unit -- produces
+        a signal that lies about itself, and every consumer downstream believes
+        the label rather than checking. That is how ``ATT.Yaw`` reached the
+        identification in degrees under a key whose contract says radians.
+
+        A missing signal is a condition this tool is built to report: the Load
+        screen lists it, the findings name what it cost. A mislabelled one is not
+        reportable by anything, because nothing can tell.
+        """
         try:
             return _UNIT_SCALE[unit]
         except KeyError:
-            note = f"{kind}.{field}: unrecognized unit {unit!r}, left unconverted"
+            note = (
+                f"{kind}.{field}: unit {unit!r} is not one this build knows how to "
+                f"convert, so the signal was dropped rather than guessed at"
+            )
             if note not in self._warnings:
                 self._warnings.append(note)
-            return 1.0
+            return None
 
     def _add(
         self,
@@ -258,9 +320,12 @@ class ArduPilotReader(LogReader):
         if value is None:
             return
         unit = self._unit_of(msg, kind, field)
+        scale = self._scale(unit, kind, field)
+        if scale is None:
+            return
         units_seen.setdefault(key, unit)
         self._source_msg.setdefault(key, f"{kind}.{field}")
-        raw.setdefault(key, []).append((t, float(value) * self._scale(unit, kind, field)))
+        raw.setdefault(key, []).append((t, float(value) * scale))
 
     def _collect(
         self,
@@ -329,24 +394,44 @@ class ArduPilotReader(LogReader):
             code = getattr(msg, "Id", None)
             if code is not None:
                 raw.setdefault("_ev", []).append((t, float(code)))
+        elif kind == "GYR":
+            # ``SampleUS`` is when the sensor was read, not when the line was
+            # written. On a message logged faster than the scheduler runs, the two
+            # differ by enough to smear the very spectrum this data exists for.
+            sample_t = float(getattr(msg, "SampleUS", 0.0)) / 1.0e6 or t
+            instance = int(getattr(msg, "I", 0))
+            for axis, field in _GYR_FIELD.items():
+                value = getattr(msg, field, None)
+                if value is not None:
+                    raw.setdefault(f"_gyr.{instance}.{axis}", []).append((sample_t, float(value)))
+        elif kind == "FTN2":
+            for axis, field in _FTN2_PEAK.items():
+                value = getattr(msg, field, None)
+                if value is not None and float(value) > 0.0:
+                    raw.setdefault(f"_fft.{axis}", []).append((t, float(value)))
 
-    def _autotune_windows(
-        self, raw: dict[str, list[tuple[float, float]]], t_end: float
+    def _event_windows(
+        self,
+        raw: dict[str, list[tuple[float, float]]],
+        opens: frozenset[int],
+        closes: frozenset[int],
+        t_end: float,
     ) -> list[tuple[float, float]]:
-        """Stretches of the flight during which autotune was running.
+        """Stretches bracketed by a pair of event codes.
 
-        A start with no matching stop runs to the end of the log rather than
-        being discarded: an autotune that was still going when the battery died
-        is exactly the flight somebody wants analysed, and dropping the window
-        would silently turn it into an ordinary flight.
+        A window left open at the end of the log runs to the end rather than
+        being discarded: a flight that was still going when the battery died, or
+        an autotune interrupted by a failsafe, is exactly the record somebody
+        wants analysed, and dropping it would silently turn it into no window at
+        all.
         """
         windows: list[tuple[float, float]] = []
         start: float | None = None
         for t, code in raw.get("_ev", []):
             value = int(code)
-            if value in _EV_AUTOTUNE_START and start is None:
+            if value in opens and start is None:
                 start = t
-            elif value in _EV_AUTOTUNE_STOP and start is not None:
+            elif value in closes and start is not None:
                 windows.append((start, t))
                 start = None
         if start is not None and t_end > start:
@@ -421,12 +506,18 @@ class ArduPilotReader(LogReader):
 
         if raw.get("_sidd.targ"):
             signals.update(self._excitation_signals(raw, params, grid))
+        signals.update(self._raw_gyro_signals(raw, params, grid))
+        signals.update(self._fft_signals(raw, grid))
 
-        autotune = self._autotune_windows(raw, float(grid[-1]))
-        if autotune:
-            signals["mode.autotune"] = gate_signal(
-                "mode.autotune", grid, autotune, source_msg="EV.Id"
-            )
+        t_end = float(grid[-1])
+        for key, opens, closes in (
+            ("mode.autotune", _EV_AUTOTUNE_START, _EV_AUTOTUNE_STOP),
+            ("mode.flying", _EV_TAKEOFF, _EV_LANDED),
+            ("mode.armed", _EV_ARMED, _EV_DISARMED),
+        ):
+            windows = self._event_windows(raw, opens, closes, t_end)
+            if windows:
+                signals[key] = gate_signal(key, grid, windows, source_msg="EV.Id")
 
         if progress is not None:
             progress(0.95, "resampled")
@@ -444,6 +535,82 @@ class ArduPilotReader(LogReader):
             params=params,
             warnings=tuple(self._warnings),
         )
+
+    def _raw_gyro_signals(
+        self,
+        raw: dict[str, list[tuple[float, float]]],
+        params: dict[str, float],
+        grid: FloatArray,
+    ) -> dict[str, Signal]:
+        """Pre-filter gyro from ``GYR``, if the firmware logged it that way.
+
+        The primary IMU only. Logging several instances is common and averaging
+        them would be wrong: the controller reads one gyro, and the whole point of
+        a pre-filter trace is to be the input to the chain whose output the
+        controller used. Which one is primary is not recorded in the message, so
+        the instance with the most samples is taken -- the primary is the one the
+        firmware logs at the full backend rate.
+
+        Silent when ``INS_RAW_LOG_OPT`` asks for post-filter samples instead. The
+        data is then perfectly good and simply is not what this key means, and a
+        post-filter trace labelled pre-filter would have the chain divided out of
+        it twice.
+        """
+        instances = {int(key.split(".")[1]) for key in raw if key.startswith("_gyr.")}
+        if not instances:
+            return {}
+        if int(params.get("INS_RAW_LOG_OPT", 0.0)) & (1 << _RAW_LOG_OPT_POST_FILTER_BIT):
+            self._warnings.append(
+                "INS_RAW_LOG_OPT asks for post-filter raw gyro, so GYR is not the "
+                "pre-filter trace the filter check needs. Clear bit 3 to log the "
+                "unfiltered samples."
+            )
+            return {}
+
+        primary = max(instances, key=lambda i: len(raw.get(f"_gyr.{i}.roll", [])))
+        out: dict[str, Signal] = {}
+        for axis in AXES:
+            samples = raw.get(f"_gyr.{primary}.{axis}")
+            if not samples or len(samples) < 4:
+                continue
+            arr = np.asarray(samples, dtype=np.float64)
+            signal = canonical_signal(
+                f"gyro.{axis}.prefilter",
+                arr[:, 0],
+                arr[:, 1],
+                source_msg=f"GYR.{_GYR_FIELD[axis]}",
+                filtered=False,
+            )
+            out[f"gyro.{axis}.prefilter"] = resample_to_grid(signal, grid)
+        if out:
+            self._warnings.append(
+                f"pre-filter gyro read from GYR (IMU {primary}) at "
+                f"{out[next(iter(out))].native_rate_hz or 0:.0f} Hz on the analysis grid"
+            )
+        return out
+
+    def _fft_signals(
+        self, raw: dict[str, list[tuple[float, float]]], grid: FloatArray
+    ) -> dict[str, Signal]:
+        """Motor frequency as the vehicle's own FFT measured it.
+
+        ``FTN2`` reports the detected peak per axis, which is the motor
+        fundamental whenever the FFT has a lock. Treated as a frequency track in
+        exactly the same way ESC telemetry is, because it answers the same
+        question -- where are the motors right now -- and a vehicle with no ESC
+        telemetry has no other source at all.
+        """
+        out: dict[str, Signal] = {}
+        for axis in AXES:
+            samples = raw.get(f"_fft.{axis}")
+            if not samples or len(samples) < 4:
+                continue
+            arr = np.asarray(samples, dtype=np.float64)
+            signal = canonical_signal(
+                f"fft.{axis}.peak_hz", arr[:, 0], arr[:, 1], source_msg=f"FTN2.{_FTN2_PEAK[axis]}"
+            )
+            out[f"fft.{axis}.peak_hz"] = resample_to_grid(signal, grid)
+        return out
 
     def _excitation_signals(
         self,

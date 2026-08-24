@@ -7,9 +7,13 @@ this file exists to catch was found by pointing the tool at a real vehicle's
 ``.bin`` and looking at what came out.
 
 The directory is gitignored and may well be empty, so every test here skips
-rather than fails when there is nothing to read. That is deliberate: a developer
-without the user's logs should still get a green suite, and a developer with them
-should get the extra coverage automatically.
+rather than fails when there is nothing to read: a developer without the user's
+logs should still get a green suite.
+
+Opt in with ``pytest -m real_log``. These are deselected from the default run
+because a modern ArduPilot log with raw IMU logging enabled runs to hundreds of
+megabytes and takes minutes to parse, and a suite nobody will sit through is a
+suite nobody runs.
 """
 
 from __future__ import annotations
@@ -27,7 +31,10 @@ from rotorid.core.types import LogBundle
 _LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 _LOGS = sorted(_LOG_DIR.glob("*.bin")) if _LOG_DIR.is_dir() else []
 
-pytestmark = pytest.mark.skipif(not _LOGS, reason="no real logs in logs/")
+pytestmark = [
+    pytest.mark.real_log,
+    pytest.mark.skipif(not _LOGS, reason="no real logs in logs/"),
+]
 
 
 @pytest.fixture(scope="module", params=[p.name for p in _LOGS])

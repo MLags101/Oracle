@@ -39,7 +39,7 @@ from rotorid.core.analysis.oscillation import Oscillation, detect_oscillation, m
 from rotorid.core.analysis.spectra import (
     InstrumentedEstimate,
     SpectralEstimate,
-    choose_nperseg,
+    choose_shared_nperseg,
     combine,
     combine_iv,
     estimate_frf,
@@ -189,8 +189,26 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     instrument_key, rung = choose_instrument(bundle, axis)
     chain = chain_from_bundle(bundle, axis)
     fs = bundle.sample_rate_hz
-    f_lowest = min((s.f_start_hz or 0.5) for s in segments)
     min_averages = config.int_("spectra", "min_averages")
+
+    # Windowed first, planned second, estimated third. The window length has to be
+    # the same for every segment on the axis -- the estimates are merged by summing
+    # spectra, and spectra on different grids cannot be summed at all -- so it
+    # cannot be chosen until every segment's length is known.
+    cuts = [
+        windowed_signals(bundle, axis, segment, instrument_key=instrument_key, rung=rung)
+        for segment in segments
+    ]
+    declared = [s.f_start_hz for s in segments if s.f_start_hz]
+    try:
+        nperseg, f_lowest, usable = choose_shared_nperseg(
+            [cut.plant_input.size for cut in cuts],
+            fs,
+            f_lowest_hz=min(declared) if declared else None,
+            min_averages=min_averages,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{axis}: {exc}") from None
 
     # Both estimators are computed on every segment. The instrument-variable one
     # is the answer; the direct one is kept so the two can be compared, which is
@@ -203,14 +221,8 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
     by_segment: dict[ExcitationSegment, SpectralEstimate | InstrumentedEstimate] = {}
     rungs: set[Rung] = set()
     summed = False
-    for segment in segments:
-        cut = windowed_signals(bundle, axis, segment, instrument_key=instrument_key, rung=rung)
-        try:
-            nperseg = choose_nperseg(
-                cut.plant_input.size, fs, f_lowest_hz=f_lowest, min_averages=min_averages
-            )
-        except ValueError:
-            continue
+    for index in usable:
+        segment, cut = segments[index], cuts[index]
         rungs.add(cut.rung)
         summed = summed or cut.summed_injection
         direct = estimate_frf(
@@ -236,11 +248,6 @@ def identify_axis(bundle: LogBundle, axis: Axis, config: Config) -> AxisAnalysis
             )
             iv_estimates.append(instrumented)
             by_segment[segment] = instrumented
-    if not direct_estimates:
-        raise ValueError(
-            f"every {axis} segment is too short to resolve {f_lowest:g} Hz; "
-            "lengthen SID_T_REC or start the sweep higher"
-        )
     # A segment where the stick sat still demotes only itself; mixing an
     # instrumented and an uninstrumented segment into one estimate would be
     # averaging an unbiased number with a biased one.
